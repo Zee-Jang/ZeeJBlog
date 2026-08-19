@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
+import app.routers.admin as admin_router
 from app.auth import hash_password
 from app.database import SessionLocal
 from app.migrate import migrate_schema
@@ -196,3 +197,45 @@ def test_admin_can_soft_delete_and_restore_user(client: TestClient) -> None:
     profile = client.get("/api/auth/me", headers=restored_headers)
     assert profile.status_code == 200, profile.text
     assert profile.json()["email"] == visitor_email
+
+
+def test_admin_can_send_escaped_email_notice(
+    client: TestClient, monkeypatch,
+) -> None:
+    admin_headers = _login(client, ADMIN_EMAIL, ADMIN_PASSWORD)
+    visitor_email, _ = _ensure_visitor()
+    with SessionLocal() as db:
+        visitor_id = db.query(User).filter(User.email == visitor_email).one().id
+
+    sent: dict[str, str] = {}
+
+    def fake_send_email(
+        to_email: str,
+        subject: str,
+        body: str,
+        html_body: str | None = None,
+    ) -> None:
+        sent.update(
+            to_email=to_email,
+            subject=subject,
+            body=body,
+            html_body=html_body or "",
+        )
+
+    monkeypatch.setattr(admin_router, "send_email", fake_send_email)
+    response = client.post(
+        "/api/admin/email-notifications",
+        headers=admin_headers,
+        json={
+            "user_id": visitor_id,
+            "subject": "A personal note",
+            "content": "Hello <script>alert('x')</script>\n\nSecond paragraph",
+            "also_in_app": True,
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert sent["to_email"] == visitor_email
+    assert sent["subject"] == "【Zeej】A personal note"
+    assert "<script>" not in sent["html_body"]
+    assert "&lt;script&gt;" in sent["html_body"]
+    assert "Second paragraph" in sent["html_body"]

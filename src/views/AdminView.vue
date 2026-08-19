@@ -86,10 +86,12 @@ const muteHours = ref<string>('24')
 const muteModalOpen = ref(false)
 const muteBusy = ref(false)
 
-const notifyTarget = ref<'all' | string>('all')
+const notifyChannel = ref<'email' | 'inApp'>('email')
+const notifyTarget = ref<'all' | string>('')
 const notifyTitle = ref('')
 const notifyBody = ref('')
 const notifyBusy = ref(false)
+const notifyAlsoInApp = ref(true)
 
 const restoreEmail = ref('')
 const restoreNickname = ref('')
@@ -179,6 +181,20 @@ const origin = computed(() => (typeof window !== 'undefined' ? window.location.o
 const activeRecipients = computed(() =>
   users.value.filter((u) => u.is_active && u.role !== 'admin'),
 )
+const emailRecipients = computed(() =>
+  activeRecipients.value.filter((u) => !u.is_bot && Boolean(u.email)),
+)
+const selectedNotifyUser = computed(() =>
+  activeRecipients.value.find((u) => String(u.id) === notifyTarget.value) || null,
+)
+const notifyBodyLimit = computed(() => (notifyChannel.value === 'email' ? 5000 : 500))
+
+function setNotifyChannel(channel: 'email' | 'inApp') {
+  notifyChannel.value = channel
+  notifyTarget.value = channel === 'email' ? '' : 'all'
+  error.value = ''
+  tip.value = ''
+}
 
 const reasons = [
   { value: 'content_violation', key: 'admin.reasonContent' },
@@ -816,10 +832,30 @@ async function sendNotify() {
     tip.value = ''
     return
   }
+  if (notifyChannel.value === 'email' && !selectedNotifyUser.value) {
+    error.value = t('admin.emailNeedTarget')
+    tip.value = ''
+    return
+  }
   error.value = ''
   tip.value = ''
   notifyBusy.value = true
   try {
+    if (notifyChannel.value === 'email') {
+      const { data } = await api.post<{ detail: string }>('/api/admin/email-notifications', {
+        user_id: Number(notifyTarget.value),
+        subject: title,
+        content,
+        also_in_app: notifyAlsoInApp.value,
+      })
+      const ok = data.detail || t('admin.emailOk')
+      tip.value = ok
+      showToast(ok)
+      notifyTitle.value = ''
+      notifyBody.value = ''
+      notifyTarget.value = ''
+      return
+    }
     const payload: { title: string; content: string; user_id?: number } = {
       title,
       content,
@@ -835,7 +871,10 @@ async function sendNotify() {
     notifyBody.value = ''
     notifyTarget.value = 'all'
   } catch (e: unknown) {
-    error.value = formatApiError(e, t('admin.notifyFail'))
+    error.value = formatApiError(
+      e,
+      notifyChannel.value === 'email' ? t('admin.emailFail') : t('admin.notifyFail'),
+    )
   } finally {
     notifyBusy.value = false
   }
@@ -994,23 +1033,53 @@ onMounted(async () => {
       <header class="panel-head">
         <button type="button" class="back" @click="backToMenu">← {{ t('admin.backMenu') }}</button>
         <h2>{{ t('admin.notifyTitle') }}</h2>
-        <p>{{ t('admin.notifyDesc') }}</p>
+        <p>{{ notifyChannel === 'email' ? t('admin.emailDesc') : t('admin.notifyDesc') }}</p>
       </header>
+      <div class="notify-mode" role="tablist" :aria-label="t('admin.notifyChannel')">
+        <button
+          type="button"
+          :class="{ on: notifyChannel === 'email' }"
+          @click="setNotifyChannel('email')"
+        >
+          <span aria-hidden="true">✉</span> {{ t('admin.notifyModeEmail') }}
+        </button>
+        <button
+          type="button"
+          :class="{ on: notifyChannel === 'inApp' }"
+          @click="setNotifyChannel('inApp')"
+        >
+          <span aria-hidden="true">●</span> {{ t('admin.notifyModeInApp') }}
+        </button>
+      </div>
       <div class="field">
         <label>{{ t('admin.notifyTarget') }}</label>
         <select v-model="notifyTarget">
-          <option value="all">{{ t('admin.notifyAll') }}</option>
-          <option v-for="u in activeRecipients" :key="u.id" :value="String(u.id)">
+          <option v-if="notifyChannel === 'email'" value="" disabled>{{ t('admin.emailChoose') }}</option>
+          <option v-else value="all">{{ t('admin.notifyAll') }}</option>
+          <option
+            v-for="u in notifyChannel === 'email' ? emailRecipients : activeRecipients"
+            :key="u.id"
+            :value="String(u.id)"
+          >
             {{ u.nickname }}{{ u.email ? ` · ${u.email}` : '' }}
           </option>
         </select>
+      </div>
+      <div v-if="notifyChannel === 'email' && selectedNotifyUser" class="recipient-card">
+        <span class="recipient-avatar">{{ selectedNotifyUser.nickname.slice(0, 1).toUpperCase() }}</span>
+        <span class="recipient-meta">
+          <small>{{ t('admin.emailRecipient') }}</small>
+          <strong>{{ selectedNotifyUser.nickname }}</strong>
+          <em>{{ selectedNotifyUser.email }}</em>
+        </span>
+        <span class="recipient-ready" aria-hidden="true">✓</span>
       </div>
       <div class="field">
         <label>{{ t('admin.notifySubject') }}</label>
         <input
           ref="notifyTitleEl"
           v-model="notifyTitle"
-          maxlength="120"
+          :maxlength="notifyChannel === 'email' ? 160 : 120"
           :placeholder="t('admin.notifySubjectPh')"
           @input="error = ''"
         />
@@ -1020,12 +1089,33 @@ onMounted(async () => {
         <textarea
           v-model="notifyBody"
           rows="8"
-          maxlength="500"
+          :maxlength="notifyBodyLimit"
           :placeholder="t('admin.notifyBodyPh')"
           @input="error = ''"
         />
-        <span class="count">{{ notifyBody.length }}/500</span>
+        <span class="count">{{ notifyBody.length }}/{{ notifyBodyLimit }}</span>
       </div>
+      <label v-if="notifyChannel === 'email'" class="check-row">
+        <input v-model="notifyAlsoInApp" type="checkbox" />
+        <span>
+          <strong>{{ t('admin.emailAlsoInApp') }}</strong>
+          <small>{{ t('admin.emailAlsoInAppHint') }}</small>
+        </span>
+      </label>
+      <section v-if="notifyChannel === 'email'" class="mail-preview" aria-live="polite">
+        <div class="mail-preview-label">{{ t('admin.emailPreview') }}</div>
+        <div class="mail-preview-paper">
+          <header>
+            <small>A NOTE FROM ZEEJ</small>
+            <h3>{{ notifyTitle || t('admin.notifySubjectPh') }}</h3>
+          </header>
+          <div class="mail-preview-body">
+            <p>{{ t('admin.emailGreeting', { name: selectedNotifyUser?.nickname || '朋友' }) }}</p>
+            <div class="mail-copy">{{ notifyBody || t('admin.notifyBodyPh') }}</div>
+            <footer>{{ t('admin.emailFooter') }}<br /><b>zeej.me →</b></footer>
+          </div>
+        </div>
+      </section>
       <p v-if="error" class="error panel-msg">{{ error }}</p>
       <p v-else-if="tip" class="ok panel-msg">{{ tip }}</p>
       <div class="panel-actions">
@@ -1035,7 +1125,9 @@ onMounted(async () => {
           :disabled="notifyBusy"
           @click="sendNotify"
         >
-          {{ notifyBusy ? t('admin.notifySending') : t('admin.notifySend') }}
+          {{ notifyBusy
+            ? (notifyChannel === 'email' ? t('admin.emailSending') : t('admin.notifySending'))
+            : (notifyChannel === 'email' ? t('admin.emailSend') : t('admin.notifySend')) }}
         </button>
         <button class="btn ghost" type="button" :disabled="notifyBusy" @click="backToMenu">
           {{ t('admin.cancel') }}
@@ -1731,6 +1823,176 @@ onMounted(async () => {
   margin: 0;
   text-align: center;
   font-size: 0.92rem;
+}
+.notify-mode {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.45rem;
+  padding: 0.3rem;
+  border-radius: 13px;
+  background: rgba(31, 71, 57, 0.07);
+}
+.notify-mode button {
+  border: 0;
+  border-radius: 10px;
+  padding: 0.68rem 0.8rem;
+  background: transparent;
+  color: rgba(20, 32, 27, 0.58);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  transition: 0.18s ease;
+}
+.notify-mode button.on {
+  color: var(--moss-deep);
+  background: rgba(255, 255, 255, 0.92);
+  box-shadow: 0 3px 14px rgba(28, 61, 50, 0.09);
+}
+.notify-mode button span {
+  margin-right: 0.25rem;
+  font-size: 0.78rem;
+}
+.recipient-card {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.78rem;
+  border: 1px solid rgba(47, 111, 94, 0.2);
+  border-radius: 13px;
+  background: linear-gradient(135deg, rgba(230, 241, 235, 0.75), rgba(255, 255, 255, 0.8));
+}
+.recipient-avatar {
+  display: grid;
+  place-items: center;
+  width: 2.5rem;
+  height: 2.5rem;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--moss-deep);
+  color: white;
+  font-family: var(--font-display);
+  font-size: 1.1rem;
+}
+.recipient-meta {
+  display: grid;
+  min-width: 0;
+  line-height: 1.25;
+}
+.recipient-meta small {
+  color: rgba(20, 32, 27, 0.48);
+  font-size: 0.7rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.recipient-meta strong {
+  margin-top: 0.12rem;
+}
+.recipient-meta em {
+  overflow: hidden;
+  color: rgba(20, 32, 27, 0.58);
+  font-size: 0.82rem;
+  font-style: normal;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.recipient-ready {
+  display: grid;
+  place-items: center;
+  width: 1.55rem;
+  height: 1.55rem;
+  margin-left: auto;
+  border-radius: 50%;
+  background: rgba(47, 111, 94, 0.14);
+  color: var(--moss-deep);
+  font-weight: 700;
+}
+.check-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.65rem;
+  padding: 0.78rem;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  cursor: pointer;
+}
+.check-row input {
+  width: 1rem;
+  height: 1rem;
+  margin-top: 0.15rem;
+  accent-color: var(--moss-deep);
+}
+.check-row span {
+  display: grid;
+  gap: 0.18rem;
+}
+.check-row strong {
+  font-size: 0.9rem;
+}
+.check-row small {
+  color: rgba(20, 32, 27, 0.52);
+  line-height: 1.4;
+}
+.mail-preview {
+  display: grid;
+  gap: 0.45rem;
+}
+.mail-preview-label {
+  color: rgba(20, 32, 27, 0.48);
+  font-size: 0.72rem;
+  font-weight: 650;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+.mail-preview-paper {
+  overflow: hidden;
+  border: 1px solid #dce6e0;
+  border-radius: 17px;
+  background: #fff;
+  box-shadow: 0 13px 34px rgba(22, 56, 44, 0.08);
+}
+.mail-preview-paper > header {
+  padding: 1.3rem 1.45rem;
+  background: #173e32;
+  color: #fff;
+}
+.mail-preview-paper > header small {
+  font-size: 0.62rem;
+  letter-spacing: 0.18em;
+  opacity: 0.7;
+}
+.mail-preview-paper > header h3 {
+  margin: 0.55rem 0 0;
+  font-family: var(--font-display);
+  font-size: 1.4rem;
+  font-weight: 500;
+  line-height: 1.35;
+}
+.mail-preview-body {
+  padding: 1.35rem 1.45rem;
+  color: #34443d;
+}
+.mail-preview-body > p {
+  margin: 0 0 1rem;
+  color: #173e32;
+}
+.mail-copy {
+  min-height: 3.5rem;
+  color: #34443d;
+  line-height: 1.75;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.mail-preview-body footer {
+  margin-top: 1.35rem;
+  padding-top: 1rem;
+  border-top: 1px solid #e5ece8;
+  color: #718078;
+  font-size: 0.76rem;
+  line-height: 1.7;
+}
+.mail-preview-body footer b {
+  color: #246b55;
+  font-weight: 500;
 }
 .lead-tabs {
   display: flex;
