@@ -171,6 +171,20 @@ def test_admin_can_soft_delete_and_restore_user(client: TestClient) -> None:
     assert deleted.status_code == 200, deleted.text
     assert client.get("/api/auth/me", headers=visitor_headers).status_code == 401
 
+    weak_password = client.post(
+        f"/api/admin/users/{visitor_id}/restore",
+        headers=admin_headers,
+        json={"password": "short"},
+    )
+    assert weak_password.status_code == 422
+
+    invalid_email = client.post(
+        f"/api/admin/users/{visitor_id}/restore",
+        headers=admin_headers,
+        json={"email": "not-an-email", "password": "Restored123"},
+    )
+    assert invalid_email.status_code == 422
+
     restored = client.post(
         f"/api/admin/users/{visitor_id}/restore",
         headers=admin_headers,

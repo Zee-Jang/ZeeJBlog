@@ -2,7 +2,7 @@ from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import PlainTextResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
 from sqlalchemy import or_
 from sqlalchemy.orm import Session, joinedload
 
@@ -17,7 +17,7 @@ from app.models import (
     User,
     UserRole,
 )
-from app.schemas import MessageOk, PublicUserOut, UtcDateTimeOpt
+from app.schemas import MessageOk, PublicUserOut, UtcDateTimeOpt, validate_password
 from app.services import (
     clear_mute_notifications,
     mute_active,
@@ -100,9 +100,14 @@ class AdminUserDetailOut(AdminUserOut):
 
 
 class RestoreUserIn(BaseModel):
-    email: str | None = Field(default=None, max_length=255)
+    email: EmailStr | None = None
     nickname: str | None = Field(default=None, max_length=30)
-    password: str = Field(min_length=6, max_length=128)
+    password: str = Field(max_length=128)
+
+    @field_validator("password")
+    @classmethod
+    def password_rules(cls, value: str) -> str:
+        return validate_password(value)
 
 
 class RestoreChatIn(BaseModel):
@@ -463,7 +468,9 @@ def restore_user(
     nick = (payload.nickname or user.previous_nickname or "").strip()
     if not nick:
         nick = email.split("@", 1)[0][:30] or f"user{user.id}"
-    nick = nick[:30]
+    from app.moderation import assert_nickname_ok
+
+    nick = assert_nickname_ok(nick[:30])
 
     user.email = email
     user.nickname = nick
