@@ -115,9 +115,8 @@ async function onSubmit() {
         {{ loading ? t('gate.loggingIn') : t('gate.login') }}
       </button>
       <p class="foot">
-        <RouterLink to="/register">{{ t('gate.registerLink') }}</RouterLink>
-        ·
-        <RouterLink to="/forgot-password">{{ t('gate.forgotLink') }}</RouterLink>
+        <RouterLink class="foot-link" to="/register">{{ t('gate.registerLink') }}</RouterLink>
+        <RouterLink class="foot-link" to="/forgot-password">{{ t('gate.forgotLink') }}</RouterLink>
       </p>
     </form>
   </div>
@@ -176,10 +175,27 @@ h1 {
   font-family: var(--font-display);
   font-weight: 500;
 }
-.sub,
-.foot {
+.sub {
   margin: 0;
   color: rgba(20, 32, 27, 0.65);
+}
+.foot {
+  margin: 0.35rem 0 0;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 2.25rem;
+  flex-wrap: wrap;
+  color: rgba(20, 32, 27, 0.65);
+}
+.foot-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 2.6rem;
+  padding: 0.45rem 0.65rem;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
 }
 .remember {
   display: flex;
@@ -215,7 +231,8 @@ h1 {
   border: 1px solid rgba(180, 60, 50, 0.22);
   color: #9a3b32;
 }
-.foot a {
+.foot a,
+.foot-link {
   color: var(--moss-deep);
   font-weight: 600;
 }

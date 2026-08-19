@@ -163,7 +163,6 @@ async function onSubmit() {
         {{ t('gate.hasAccount') }}
         <RouterLink to="/login">{{ t('gate.goLogin') }}</RouterLink>
       </p>
-      <p class="tip">{{ t('gate.devTip') }}</p>
     </form>
   </div>
 </template>

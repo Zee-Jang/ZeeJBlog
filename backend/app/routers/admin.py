@@ -3,11 +3,20 @@ from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
+from sqlalchemy import or_
 from sqlalchemy.orm import Session, joinedload
 
 from app.auth import display_name, require_admin
 from app.database import get_db
-from app.models import ChatMessage, InviteCode, NotificationType, User, UserRole
+from app.models import (
+    ChatMessage,
+    ChatThread,
+    InviteCode,
+    NotificationType,
+    ThreadStatus,
+    User,
+    UserRole,
+)
 from app.schemas import MessageOk, PublicUserOut, UtcDateTimeOpt
 from app.services import (
     clear_mute_notifications,
@@ -86,6 +95,35 @@ class AdminUserDetailOut(AdminUserOut):
     inviter_id: int | None = None
     message_count: int = 0
     password_note: str = "密码已加密保存，站长无法查看明文"
+    previous_email: str | None = None
+    previous_nickname: str | None = None
+
+
+class RestoreUserIn(BaseModel):
+    email: str | None = Field(default=None, max_length=255)
+    nickname: str | None = Field(default=None, max_length=30)
+    password: str = Field(min_length=6, max_length=128)
+
+
+class RestoreChatIn(BaseModel):
+    user_a_id: int
+    user_b_id: int
+
+
+class AdminThreadOut(BaseModel):
+    thread_id: int
+    peer_id: int
+    peer_nickname: str
+    peer_active: bool
+    message_count: int
+    hidden_count: int
+    status: ThreadStatus
+
+
+class RestoreChatOut(BaseModel):
+    detail: str
+    restored: int
+    thread_id: int
 
 
 class BotPermissionIn(BaseModel):
@@ -195,6 +233,8 @@ def get_user_detail(
         inviter_id=inviter_id,
         message_count=msg_count,
         password_note="密码已加密保存，站长无法查看明文",
+        previous_email=user.previous_email,
+        previous_nickname=user.previous_nickname,
     )
 
 
@@ -224,7 +264,11 @@ def export_user_messages(
         stamp = ""
         if m.created_at:
             stamp = m.created_at.replace(tzinfo=UTC).astimezone(EAST_ASIA).strftime("%Y-%m-%d %H:%M:%S")
-        deleted = " [deleted]" if m.deleted_at else ""
+        deleted = ""
+        if m.recalled_at:
+            deleted = " [recalled]"
+        elif m.deleted_at:
+            deleted = " [deleted]"
         content = (m.content or "").replace("\r\n", "\n")
         lines.append(f"[{stamp}] thread={m.thread_id} status={m.status}{deleted}")
         lines.append(content)
@@ -328,35 +372,190 @@ def delete_user(
     db: Session = Depends(get_db),
     admin: User = Depends(require_admin),
 ) -> MessageOk:
+    """软删除用户：不删聊天/帖子等关联数据。
+
+    - 改写邮箱释放占用，便于同一邮箱重新注册成「新账号」
+    - is_active=False + 抬升 token_version，旧登录立刻失效
+    - 登录按原邮箱查不到行，与「邮箱或密码错误」表现一致
+    - 脱敏昵称/头像等，历史会话里只看到已删除壳，看不到原资料
+    """
     _ = admin
+    from secrets import token_urlsafe
+
+    from app.auth import hash_password
+    from app.bot import is_bot_user
+
     user = db.get(User, user_id)
     if not user:
         raise HTTPException(status_code=404, detail="用户不存在")
     if user.role == UserRole.admin:
         raise HTTPException(status_code=400, detail="不能删除站长账号")
-    from app.bot import is_bot_user
-
     if is_bot_user(user):
-        raise HTTPException(status_code=400, detail="不能停用 Bot 账号")
+        raise HTTPException(status_code=400, detail="不能删除 Bot 账号")
     if not user.is_active and (user.email or "").startswith("deleted+"):
-        return MessageOk(detail="用户已停用")
+        return MessageOk(detail="用户已删除")
 
-    # 释放邮箱占用，便于日后重新注册；作废其发出的邀请
     stamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    # 备份原邮箱/昵称，便于站长恢复
+    if user.email and not (user.email or "").startswith("deleted+"):
+        user.previous_email = user.email
+    nick = (user.nickname or user.name or "").strip()
+    if nick and nick != "已删除用户":
+        user.previous_nickname = nick[:30]
+    # 释放真实邮箱；聊天 sender_id 仍指向本行，消息原文保留
     user.email = f"deleted+{user.id}.{stamp}@invalid.local"
     user.is_active = False
     user.allow_message_requests = False
+    user.nickname = "已删除用户"
+    user.name = "已删除用户"
+    user.avatar_url = None
+    user.bio = ""
+    user.show_email = False
     user.muted_until = None
     user.mute_reason = ""
+    user.password_hash = hash_password(token_urlsafe(48))
     user.token_version = (user.token_version or 1) + 1
     db.query(InviteCode).filter(InviteCode.created_by_id == user.id).update(
         {"is_active": False},
         synchronize_session=False,
     )
     clear_mute_notifications(db, user_id=user.id)
-    # 停用后无法登录，不再写站内通知
     db.commit()
-    return MessageOk(detail="用户已停用（邮箱已释放，其邀请码已作废）")
+    return MessageOk(detail="用户已删除（资料已脱敏，聊天等记录仍保留；原邮箱可重新注册）")
+
+
+@router.post("/users/{user_id}/restore", response_model=MessageOk)
+def restore_user(
+    user_id: int,
+    payload: RestoreUserIn,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+) -> MessageOk:
+    """恢复软删除用户：写回邮箱、昵称，设置新密码，重新允许登录。"""
+    _ = admin
+    from app.auth import hash_password
+    from app.bot import is_bot_user
+
+    user = db.get(User, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    if user.role == UserRole.admin:
+        raise HTTPException(status_code=400, detail="站长账号无需恢复")
+    if is_bot_user(user):
+        raise HTTPException(status_code=400, detail="不能操作 Bot 账号")
+    if user.is_active:
+        return MessageOk(detail="用户已是正常状态")
+
+    email = (payload.email or user.previous_email or "").strip().lower()
+    if not email or email.startswith("deleted+") or "@invalid.local" in email:
+        raise HTTPException(status_code=400, detail="请填写要恢复使用的邮箱")
+    if "@" not in email or len(email) < 5:
+        raise HTTPException(status_code=400, detail="邮箱格式不正确")
+
+    taken = (
+        db.query(User)
+        .filter(User.email == email, User.id != user.id)
+        .first()
+    )
+    if taken:
+        raise HTTPException(status_code=400, detail="该邮箱已被其他账号占用，请换一个邮箱")
+
+    nick = (payload.nickname or user.previous_nickname or "").strip()
+    if not nick:
+        nick = email.split("@", 1)[0][:30] or f"user{user.id}"
+    nick = nick[:30]
+
+    user.email = email
+    user.nickname = nick
+    user.name = nick
+    user.is_active = True
+    user.allow_message_requests = True
+    user.password_hash = hash_password(payload.password)
+    user.token_version = (user.token_version or 1) + 1
+    user.previous_email = None
+    user.previous_nickname = None
+    db.commit()
+    return MessageOk(detail=f"已恢复账号「{nick}」，可用新密码登录")
+
+
+@router.get("/users/{user_id}/threads", response_model=list[AdminThreadOut])
+def list_user_threads(
+    user_id: int,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+) -> list[AdminThreadOut]:
+    user = db.get(User, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    threads = (
+        db.query(ChatThread)
+        .filter((ChatThread.user_a_id == user_id) | (ChatThread.user_b_id == user_id))
+        .order_by(ChatThread.updated_at.desc())
+        .all()
+    )
+    out: list[AdminThreadOut] = []
+    for th in threads:
+        peer_id = th.user_b_id if th.user_a_id == user_id else th.user_a_id
+        peer = db.get(User, peer_id)
+        msgs = db.query(ChatMessage).filter(ChatMessage.thread_id == th.id).all()
+        hidden = sum(1 for m in msgs if m.deleted_at is not None or m.recalled_at is not None)
+        out.append(
+            AdminThreadOut(
+                thread_id=th.id,
+                peer_id=peer_id,
+                peer_nickname=display_name(peer) if peer else f"#{peer_id}",
+                peer_active=bool(peer and peer.is_active),
+                message_count=len(msgs),
+                hidden_count=hidden,
+                status=th.status,
+            )
+        )
+    return out
+
+
+@router.post("/chat/restore-messages", response_model=RestoreChatOut)
+def restore_chat_messages(
+    payload: RestoreChatIn,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+) -> RestoreChatOut:
+    """恢复两人会话中全部被清空/撤回的消息，重新显示在聊天界面。"""
+    _ = admin
+    if payload.user_a_id == payload.user_b_id:
+        raise HTTPException(status_code=400, detail="请选择两个不同的用户")
+    a = db.get(User, payload.user_a_id)
+    b = db.get(User, payload.user_b_id)
+    if not a or not b:
+        raise HTTPException(status_code=404, detail="用户不存在")
+
+    lo, hi = sorted((payload.user_a_id, payload.user_b_id))
+    thread = (
+        db.query(ChatThread)
+        .filter(ChatThread.user_a_id == lo, ChatThread.user_b_id == hi)
+        .first()
+    )
+    if not thread:
+        raise HTTPException(status_code=404, detail="这两人之间没有聊天记录")
+
+    rows = (
+        db.query(ChatMessage)
+        .filter(
+            ChatMessage.thread_id == thread.id,
+            or_(ChatMessage.deleted_at.isnot(None), ChatMessage.recalled_at.isnot(None)),
+        )
+        .all()
+    )
+    for m in rows:
+        m.deleted_at = None
+        m.recalled_at = None
+    thread.status = ThreadStatus.active
+    thread.updated_at = datetime.utcnow()
+    db.commit()
+    return RestoreChatOut(
+        detail=f"已恢复 {len(rows)} 条消息（{display_name(a)} ↔ {display_name(b)}）",
+        restored=len(rows),
+        thread_id=thread.id,
+    )
 
 
 @router.post("/notifications", response_model=MessageOk)

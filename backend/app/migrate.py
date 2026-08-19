@@ -34,6 +34,8 @@ def migrate_schema() -> None:
         ("bot_rounds_used", "ALTER TABLE users ADD COLUMN bot_rounds_used INTEGER DEFAULT 0"),
         ("bot_msgs_per_round", "ALTER TABLE users ADD COLUMN bot_msgs_per_round INTEGER DEFAULT 100"),
         ("bot_msgs_this_round", "ALTER TABLE users ADD COLUMN bot_msgs_this_round INTEGER DEFAULT 0"),
+        ("previous_email", "ALTER TABLE users ADD COLUMN previous_email VARCHAR(255)"),
+        ("previous_nickname", "ALTER TABLE users ADD COLUMN previous_nickname VARCHAR(30)"),
     ]
     if "users" in tables:
         with engine.begin() as conn:
@@ -75,6 +77,27 @@ def migrate_schema() -> None:
             with engine.begin() as conn:
                 conn.execute(text("ALTER TABLE chat_messages ADD COLUMN deleted_at DATETIME"))
 
+    if "chat_messages" in inspect(engine).get_table_names() and not _has_column(
+        "chat_messages", "recalled_at"
+    ):
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE chat_messages ADD COLUMN recalled_at DATETIME"))
+
+    if "chat_messages" in inspect(engine).get_table_names():
+        with engine.begin() as conn:
+            if not _has_column("chat_messages", "reply_to_id"):
+                conn.execute(text("ALTER TABLE chat_messages ADD COLUMN reply_to_id INTEGER"))
+            if not _has_column("chat_messages", "reply_sender_name"):
+                conn.execute(
+                    text("ALTER TABLE chat_messages ADD COLUMN reply_sender_name VARCHAR(100)")
+                )
+            if not _has_column("chat_messages", "reply_content_snapshot"):
+                conn.execute(
+                    text(
+                        "ALTER TABLE chat_messages ADD COLUMN reply_content_snapshot VARCHAR(500)"
+                    )
+                )
+
     project_cols = [
         ("github_url", "ALTER TABLE projects ADD COLUMN github_url VARCHAR(500)"),
         ("readme", "ALTER TABLE projects ADD COLUMN readme TEXT DEFAULT ''"),
@@ -91,3 +114,5 @@ def migrate_schema() -> None:
         with engine.begin() as conn:
             if not _has_column("posts", "on_home"):
                 conn.execute(text("ALTER TABLE posts ADD COLUMN on_home BOOLEAN DEFAULT 0"))
+            if not _has_column("posts", "is_hidden"):
+                conn.execute(text("ALTER TABLE posts ADD COLUMN is_hidden BOOLEAN DEFAULT 0"))

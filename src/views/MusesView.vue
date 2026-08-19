@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import api from '../api/client'
 import { useI18n } from '../i18n'
 import { useAuthStore } from '../stores/auth'
@@ -10,6 +10,7 @@ import { formatApiError } from '../utils/apiError'
 
 const auth = useAuthStore()
 const route = useRoute()
+const router = useRouter()
 const { t } = useI18n()
 const posts = ref<Post[]>([])
 const loading = ref(true)
@@ -29,12 +30,31 @@ const editKind = ref<PostKind>('muse')
 const editError = ref('')
 const appendBody = ref('')
 const appendError = ref('')
+const creating = ref(false)
+const savingEdit = ref(false)
+const savingAppend = ref(false)
+const deletingId = ref<number | null>(null)
+
+function routeOpenId(): number {
+  const fromParam = Number(route.params.id)
+  const fromQuery = Number(route.query.open)
+  if (Number.isFinite(fromParam) && fromParam > 0) return fromParam
+  if (Number.isFinite(fromQuery) && fromQuery > 0) return fromQuery
+  return 0
+}
+
+// 首屏直接进详情，避免先闪列表再跳一次
+const bootOpenId = routeOpenId()
+if (bootOpenId > 0) {
+  focusMode.value = 'view'
+  focusPostId.value = bootOpenId
+}
 
 const focusPost = computed(() => posts.value.find((p) => p.id === focusPostId.value) || null)
 const isFocused = computed(() => {
   if (focusMode.value === 'create') return true
   if (focusMode.value === 'edit' || focusMode.value === 'append' || focusMode.value === 'view') {
-    return focusPost.value !== null
+    return focusPostId.value != null
   }
   return false
 })
@@ -51,7 +71,7 @@ function setViewportLock(on: boolean) {
   window.dispatchEvent(new CustomEvent('zeej:viewport-lock', { detail: on }))
 }
 
-watch(isFocused, (on) => setViewportLock(on))
+watch(isFocused, (on) => setViewportLock(on), { immediate: true })
 
 onUnmounted(() => setViewportLock(false))
 
@@ -84,6 +104,9 @@ async function enterView(post: Post) {
   focusMode.value = 'view'
   focusPostId.value = post.id
   setViewportLock(true)
+  if (route.name !== 'muse-detail' || String(route.params.id) !== String(post.id)) {
+    await router.replace({ name: 'muse-detail', params: { id: String(post.id) } })
+  }
   await nextTick()
 }
 
@@ -111,6 +134,9 @@ function leaveFocus() {
   appendError.value = ''
   appendBody.value = ''
   resetCreateDraft()
+  if (route.name === 'muse-detail' || route.query.open) {
+    void router.replace({ name: 'muses' })
+  }
 }
 
 function onCardKey(e: KeyboardEvent, post: Post) {
@@ -121,7 +147,9 @@ function onCardKey(e: KeyboardEvent, post: Post) {
 }
 
 async function createPost() {
+  if (creating.value) return
   error.value = ''
+  creating.value = true
   try {
     await api.post('/api/posts', {
       kind: kind.value,
@@ -132,12 +160,15 @@ async function createPost() {
     await load()
   } catch (e: any) {
     error.value = formatApiError(e, t('common.publishFail'))
+  } finally {
+    creating.value = false
   }
 }
 
 async function saveEdit() {
-  if (focusPostId.value == null) return
+  if (focusPostId.value == null || savingEdit.value) return
   editError.value = ''
+  savingEdit.value = true
   try {
     await api.patch(`/api/posts/${focusPostId.value}`, {
       kind: editKind.value,
@@ -148,12 +179,15 @@ async function saveEdit() {
     await load()
   } catch (e: any) {
     editError.value = formatApiError(e, t('common.saveFail'))
+  } finally {
+    savingEdit.value = false
   }
 }
 
 async function saveAppend() {
-  if (focusPostId.value == null) return
+  if (focusPostId.value == null || savingAppend.value) return
   appendError.value = ''
+  savingAppend.value = true
   try {
     await api.post(`/api/posts/${focusPostId.value}/append`, {
       body: appendBody.value.trim(),
@@ -162,23 +196,40 @@ async function saveAppend() {
     await load()
   } catch (e: any) {
     appendError.value = formatApiError(e, t('common.saveFail'))
+  } finally {
+    savingAppend.value = false
   }
 }
 
 async function removePost(id: number) {
+  if (deletingId.value != null) return
   if (!confirm(t('muses.deleteConfirm'))) return
+  deletingId.value = id
   try {
     await api.delete(`/api/posts/${id}`)
+    posts.value = posts.value.filter((p) => p.id !== id)
     if (focusPostId.value === id) leaveFocus()
     await load()
   } catch (e: any) {
     alert(formatApiError(e, t('common.deleteFail')))
+  } finally {
+    deletingId.value = null
   }
 }
 
 async function toggleHome(post: Post) {
   try {
     const { data } = await api.post<Post>(`/api/posts/${post.id}/home`)
+    const idx = posts.value.findIndex((p) => p.id === post.id)
+    if (idx >= 0) posts.value[idx] = data
+  } catch (e: any) {
+    alert(formatApiError(e, t('admin.opFail')))
+  }
+}
+
+async function toggleHide(post: Post) {
+  try {
+    const { data } = await api.post<Post>(`/api/posts/${post.id}/hide`)
     const idx = posts.value.findIndex((p) => p.id === post.id)
     if (idx >= 0) posts.value[idx] = data
   } catch (e: any) {
@@ -195,13 +246,33 @@ function previewText(text: string) {
 }
 
 onMounted(async () => {
-  await load()
-  const openId = Number(route.query.open)
-  if (Number.isFinite(openId) && openId > 0) {
-    const post = posts.value.find((p) => p.id === openId)
-    if (post) await enterView(post)
-  }
+  if (!posts.value.length) await load()
+  await openFromRoute()
 })
+
+watch(
+  () => [route.name, route.params.id, route.query.open] as const,
+  () => {
+    void openFromRoute()
+  },
+)
+
+async function openFromRoute() {
+  const openId = routeOpenId()
+  if (!openId) {
+    if (route.name === 'muses' && focusMode.value === 'view') {
+      // 已在列表路由且无 open 参数
+      return
+    }
+    return
+  }
+  focusMode.value = 'view'
+  focusPostId.value = openId
+  setViewportLock(true)
+  if (!posts.value.length) await load()
+  const post = posts.value.find((p) => p.id === openId)
+  if (!post && !loading.value) leaveFocus()
+}
 </script>
 
 <template>
@@ -214,7 +285,10 @@ onMounted(async () => {
       </header>
 
       <div class="focus-scroll">
-        <article class="focus-card">
+        <article
+          class="focus-card"
+          :class="{ 'is-hidden-post': focusPost?.is_hidden }"
+        >
           <!-- 发布 -->
           <template v-if="focusMode === 'create'">
             <div class="focus-form create">
@@ -238,11 +312,15 @@ onMounted(async () => {
               <textarea v-model="body" class="grow" :placeholder="t('muses.bodyPh')" required />
               <p v-if="error" class="error">{{ error }}</p>
               <div class="edit-actions">
-                <button class="btn primary" type="button" @click="createPost">{{ t('muses.publish') }}</button>
+                <button class="btn primary" type="button" :disabled="creating" @click="createPost">
+                  {{ creating ? t('muses.publishing') : t('muses.publish') }}
+                </button>
                 <button class="btn ghost" type="button" @click="leaveFocus">{{ t('muses.cancel') }}</button>
               </div>
             </div>
           </template>
+
+          <p v-else-if="focusMode === 'view' && loading" class="muted">{{ t('muses.loading') }}</p>
 
           <!-- 修改 / 追记 / 全文 -->
           <template v-else-if="focusPost">
@@ -263,6 +341,14 @@ onMounted(async () => {
                   @click="toggleHome(focusPost)"
                 >
                   {{ focusPost.on_home ? t('muses.unpushHome') : t('muses.pushHome') }}
+                </button>
+                <button
+                  type="button"
+                  class="text-btn"
+                  :class="{ dim: focusPost.is_hidden }"
+                  @click="toggleHide(focusPost)"
+                >
+                  {{ focusPost.is_hidden ? t('muses.unhide') : t('muses.hide') }}
                 </button>
                 <button type="button" class="text-btn danger" @click="removePost(focusPost.id)">
                   {{ t('muses.delete') }}
@@ -297,7 +383,9 @@ onMounted(async () => {
                 <textarea v-model="editBody" class="grow" :placeholder="t('muses.bodyPh')" required />
                 <p v-if="editError" class="error">{{ editError }}</p>
                 <div class="edit-actions">
-                  <button class="btn primary" type="button" @click="saveEdit">{{ t('muses.save') }}</button>
+                  <button class="btn primary" type="button" :disabled="savingEdit" @click="saveEdit">
+                    {{ savingEdit ? t('muses.saving') : t('muses.save') }}
+                  </button>
                   <button class="btn ghost" type="button" @click="leaveFocus">{{ t('muses.cancel') }}</button>
                 </div>
               </div>
@@ -310,7 +398,9 @@ onMounted(async () => {
                 <textarea v-model="appendBody" class="grow append" :placeholder="t('muses.appendPh')" required />
                 <p v-if="appendError" class="error">{{ appendError }}</p>
                 <div class="edit-actions">
-                  <button class="btn primary" type="button" @click="saveAppend">{{ t('muses.appendSubmit') }}</button>
+                  <button class="btn primary" type="button" :disabled="savingAppend" @click="saveAppend">
+                    {{ savingAppend ? t('muses.saving') : t('muses.appendSubmit') }}
+                  </button>
                   <button class="btn ghost" type="button" @click="leaveFocus">{{ t('muses.cancel') }}</button>
                 </div>
               </div>
@@ -341,6 +431,7 @@ onMounted(async () => {
           v-for="post in posts"
           :key="post.id"
           class="card"
+          :class="{ 'is-hidden-post': post.is_hidden }"
           role="button"
           tabindex="0"
           :title="t('muses.openHint')"
@@ -350,6 +441,7 @@ onMounted(async () => {
           <div class="meta">
             <time>{{ formatDateShanghai(post.created_at, 'datetime') }}</time>
             <span class="tag">{{ kindLabel(post.kind) }}</span>
+            <span v-if="post.is_hidden" class="tag hidden-tag">{{ t('muses.hiddenTag') }}</span>
             <div v-if="auth.isAdmin" class="actions" @click.stop>
               <button type="button" class="text-btn" @click="enterFocus('edit', post)">{{ t('muses.edit') }}</button>
               <button type="button" class="text-btn" @click="enterFocus('append', post)">{{ t('muses.append') }}</button>
@@ -360,6 +452,14 @@ onMounted(async () => {
                 @click="toggleHome(post)"
               >
                 {{ post.on_home ? t('muses.unpushHome') : t('muses.pushHome') }}
+              </button>
+              <button
+                type="button"
+                class="text-btn"
+                :class="{ dim: post.is_hidden }"
+                @click="toggleHide(post)"
+              >
+                {{ post.is_hidden ? t('muses.unhide') : t('muses.hide') }}
               </button>
               <button type="button" class="text-btn danger" @click="removePost(post.id)">
                 {{ t('muses.delete') }}
@@ -475,6 +575,30 @@ h1 {
   background: var(--card-hover);
   box-shadow: 0 6px 18px rgba(20, 32, 27, 0.06);
   outline: none;
+}
+.card.is-hidden-post,
+.focus-card.is-hidden-post {
+  opacity: 0.48;
+  filter: grayscale(0.35);
+  background: rgba(238, 243, 239, 0.55);
+  border-color: rgba(20, 32, 27, 0.1);
+  box-shadow: none;
+}
+.card.is-hidden-post:hover,
+.card.is-hidden-post:focus-visible {
+  opacity: 0.62;
+  filter: grayscale(0.2);
+  border-color: rgba(20, 32, 27, 0.18);
+  box-shadow: none;
+  background: rgba(238, 243, 239, 0.7);
+}
+.hidden-tag {
+  opacity: 0.85;
+  background: rgba(20, 32, 27, 0.08) !important;
+  color: rgba(20, 32, 27, 0.55) !important;
+}
+.text-btn.dim {
+  color: rgba(20, 32, 27, 0.45);
 }
 .meta {
   display: flex;

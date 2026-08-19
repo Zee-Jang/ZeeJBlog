@@ -16,6 +16,11 @@ const router = createRouter({
         { path: 'projects', name: 'projects', component: () => import('../views/ProjectsView.vue') },
         { path: 'projects/:slug', name: 'project-detail', component: () => import('../views/ProjectDetailView.vue') },
         { path: 'muses', name: 'muses', component: () => import('../views/MusesView.vue') },
+        {
+          path: 'muses/:id(\\d+)',
+          name: 'muse-detail',
+          component: () => import('../views/MusesView.vue'),
+        },
         { path: 'diary', redirect: '/muses' },
         { path: 'social', name: 'social', component: () => import('../views/SocialHubView.vue') },
         { path: 'members', redirect: '/social' },

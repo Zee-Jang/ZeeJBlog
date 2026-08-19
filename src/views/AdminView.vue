@@ -39,6 +39,18 @@ interface AdminUserDetail extends AdminUser {
   inviter_id: number | null
   message_count: number
   password_note: string
+  previous_email?: string | null
+  previous_nickname?: string | null
+}
+
+interface AdminThread {
+  thread_id: number
+  peer_id: number
+  peer_nickname: string
+  peer_active: boolean
+  message_count: number
+  hidden_count: number
+  status: string
 }
 
 interface BotDoc {
@@ -78,6 +90,13 @@ const notifyTarget = ref<'all' | string>('all')
 const notifyTitle = ref('')
 const notifyBody = ref('')
 const notifyBusy = ref(false)
+
+const restoreEmail = ref('')
+const restoreNickname = ref('')
+const restorePassword = ref('')
+const restoreBusy = ref(false)
+const userThreads = ref<AdminThread[]>([])
+const restoreChatBusyId = ref<number | null>(null)
 
 const homeLeads = ref<Record<string, string>>({
   'zh-CN': '',
@@ -599,11 +618,14 @@ async function openUser(id: number) {
   error.value = ''
   muteModalOpen.value = false
   loadingDetail.value = true
+  userThreads.value = []
   try {
     const { data } = await api.get<AdminUserDetail>(`/api/admin/users/${id}`)
     detail.value = data
     botPresetDraft.value = data.bot_preset || 'normal'
+    fillRestoreDraft(data)
     panel.value = 'users'
+    await loadUserThreads(id)
   } catch (e: unknown) {
     error.value = formatApiError(e, t('admin.loadFail'))
     detail.value = null
@@ -620,7 +642,9 @@ async function openUserKeepTip(id: number) {
     const { data } = await api.get<AdminUserDetail>(`/api/admin/users/${id}`)
     detail.value = data
     botPresetDraft.value = data.bot_preset || 'normal'
+    fillRestoreDraft(data)
     panel.value = 'users'
+    await loadUserThreads(id)
   } catch (e: unknown) {
     error.value = formatApiError(e, t('admin.loadFail'))
     detail.value = null
@@ -632,6 +656,7 @@ async function openUserKeepTip(id: number) {
 function closeDetail() {
   muteModalOpen.value = false
   detail.value = null
+  userThreads.value = []
   panel.value = 'users'
 }
 
@@ -683,6 +708,78 @@ async function removeUser() {
     await load()
   } catch (e: unknown) {
     error.value = formatApiError(e, t('admin.opFail'))
+  }
+}
+
+async function loadUserThreads(userId: number) {
+  try {
+    const { data } = await api.get<AdminThread[]>(`/api/admin/users/${userId}/threads`)
+    userThreads.value = data
+  } catch {
+    userThreads.value = []
+  }
+}
+
+function fillRestoreDraft(d: AdminUserDetail) {
+  restoreEmail.value = d.previous_email || ''
+  restoreNickname.value = d.previous_nickname || ''
+  restorePassword.value = ''
+}
+
+async function restoreUser() {
+  if (!detail.value) return
+  const id = detail.value.id
+  error.value = ''
+  if (!restorePassword.value || restorePassword.value.length < 6) {
+    error.value = t('admin.restorePwdNeed')
+    return
+  }
+  if (!confirm(t('admin.restoreConfirm', { name: detail.value.nickname }))) return
+  restoreBusy.value = true
+  try {
+    const { data } = await api.post<{ detail: string }>(`/api/admin/users/${id}/restore`, {
+      email: restoreEmail.value.trim() || undefined,
+      nickname: restoreNickname.value.trim() || undefined,
+      password: restorePassword.value,
+    })
+    tip.value = data.detail || t('admin.restoredOk')
+    restorePassword.value = ''
+    await load()
+    await openUserKeepTip(id)
+  } catch (e: unknown) {
+    error.value = formatApiError(e, t('admin.opFail'))
+  } finally {
+    restoreBusy.value = false
+  }
+}
+
+async function restoreChatWithPeer(peerId: number) {
+  if (!detail.value) return
+  const peer = userThreads.value.find((x) => x.peer_id === peerId)
+  const label = peer?.peer_nickname || String(peerId)
+  if (
+    !confirm(
+      t('admin.restoreChatConfirm', {
+        a: detail.value.nickname,
+        b: label,
+      }),
+    )
+  ) {
+    return
+  }
+  error.value = ''
+  restoreChatBusyId.value = peerId
+  try {
+    const { data } = await api.post<{ detail: string; restored: number }>(
+      '/api/admin/chat/restore-messages',
+      { user_a_id: detail.value.id, user_b_id: peerId },
+    )
+    tip.value = data.detail || t('admin.restoreChatOk', { n: data.restored })
+    await loadUserThreads(detail.value.id)
+  } catch (e: unknown) {
+    error.value = formatApiError(e, t('admin.opFail'))
+  } finally {
+    restoreChatBusyId.value = null
   }
 }
 
@@ -1239,6 +1336,84 @@ onMounted(async () => {
             </dd>
           </div>
         </dl>
+      </div>
+
+      <div
+        v-if="detail.role !== 'admin' && !detail.is_active && !detail.is_bot"
+        class="ops restore-box"
+      >
+        <h3 class="ops-title">{{ t('admin.restoreTitle') }}</h3>
+        <p class="hint">{{ t('admin.restoreHint') }}</p>
+        <div class="field">
+          <label>{{ t('admin.fieldEmail') }}</label>
+          <input
+            v-model="restoreEmail"
+            type="email"
+            maxlength="255"
+            :placeholder="t('admin.restoreEmailPh')"
+          />
+        </div>
+        <div class="field">
+          <label>{{ t('admin.fieldNick') }}</label>
+          <input
+            v-model="restoreNickname"
+            type="text"
+            maxlength="30"
+            :placeholder="t('admin.restoreNickPh')"
+          />
+        </div>
+        <div class="field">
+          <label>{{ t('admin.restorePwd') }}</label>
+          <input
+            v-model="restorePassword"
+            type="text"
+            maxlength="128"
+            autocomplete="new-password"
+            :placeholder="t('admin.restorePwdPh')"
+          />
+        </div>
+        <button
+          class="btn primary"
+          type="button"
+          :disabled="restoreBusy"
+          @click="restoreUser"
+        >
+          {{ restoreBusy ? t('admin.restoring') : t('admin.restore') }}
+        </button>
+      </div>
+
+      <div
+        v-if="detail.role !== 'admin' && !detail.is_bot"
+        class="ops restore-chat-box"
+      >
+        <h3 class="ops-title">{{ t('admin.restoreChatTitle') }}</h3>
+        <p class="hint">{{ t('admin.restoreChatHint') }}</p>
+        <ul v-if="userThreads.length" class="thread-restore-list">
+          <li v-for="th in userThreads" :key="th.thread_id">
+            <div class="thread-meta">
+              <strong>{{ th.peer_nickname }}</strong>
+              <span class="muted">
+                {{ t('admin.restoreChatStats', { total: th.message_count, hidden: th.hidden_count }) }}
+              </span>
+              <span v-if="!th.peer_active" class="bad">{{ t('admin.inactive') }}</span>
+            </div>
+            <button
+              class="btn ghost"
+              type="button"
+              :disabled="restoreChatBusyId === th.peer_id || th.hidden_count === 0"
+              @click="restoreChatWithPeer(th.peer_id)"
+            >
+              {{
+                restoreChatBusyId === th.peer_id
+                  ? t('admin.restoringChat')
+                  : th.hidden_count === 0
+                    ? t('admin.restoreChatNone')
+                    : t('admin.restoreChat')
+              }}
+            </button>
+          </li>
+        </ul>
+        <p v-else class="hint">{{ t('admin.restoreChatEmpty') }}</p>
       </div>
 
       <div
@@ -1816,6 +1991,38 @@ code {
   gap: 0.55rem;
   padding-top: 0.35rem;
   border-top: 1px solid var(--line);
+}
+.restore-box .field,
+.restore-chat-box .field {
+  display: grid;
+  gap: 0.3rem;
+}
+.thread-restore-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.55rem;
+}
+.thread-restore-list li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.55rem 0.65rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(238, 243, 239, 0.55);
+}
+.thread-meta {
+  display: grid;
+  gap: 0.15rem;
+  min-width: 0;
+}
+.thread-meta .muted {
+  font-size: 0.85rem;
+  color: rgba(20, 32, 27, 0.5);
 }
 .modal-mask {
   position: fixed;

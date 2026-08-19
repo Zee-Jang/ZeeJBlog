@@ -26,12 +26,12 @@ settings = get_settings()
 
 
 def _code_sent_detail(code: str) -> str:
-    # 仅显式开启 MAIL_DEV_MODE 时回传验证码；未配 SMTP 时只提示看终端
+    # 仅显式开启 MAIL_DEV_MODE 时回传验证码；正式环境只提示查收邮箱
     if settings.mail_dev_mode:
         return f"验证码已发送（开发模式）：{code}"
     if not settings.smtp_ready:
-        return "验证码已生成（未配置邮件服务，请查看后端终端日志）"
-    return "验证码已发送，请查收邮箱"
+        return "邮件服务未配置，暂时无法发送验证码。请联系站长。"
+    return "验证码已发送，请查收邮箱（含垃圾箱）"
 
 
 def _validate_invite(invite: InviteCode | None) -> InviteCode:

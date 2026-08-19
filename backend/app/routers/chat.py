@@ -25,7 +25,7 @@ from app.models import (
     ThreadStatus,
     User,
 )
-from app.schemas import MessageCreate, MessageOk, MessageOut, ThreadOut
+from app.schemas import MessageCreate, MessageOk, MessageOut, MessageReplyOut, ThreadOut
 from app.services import is_admin, is_blocked, mute_active, pair_ids
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
@@ -45,18 +45,53 @@ def _assert_member(thread: ChatThread | None, me: User) -> ChatThread:
     return thread
 
 
+def _reply_out(msg: ChatMessage) -> MessageReplyOut | None:
+    if not msg.reply_to_id:
+        return None
+    ref = msg.reply_to
+    recalled = bool(ref and ref.recalled_at is not None)
+    # 原消息被清空时仍用发送时快照
+    if ref is None or ref.deleted_at is not None:
+        content = (msg.reply_content_snapshot or "").strip()
+        name = (msg.reply_sender_name or "").strip() or "用户"
+        return MessageReplyOut(
+            id=msg.reply_to_id,
+            sender_name=name,
+            content="" if not content else content,
+            recalled=False,
+        )
+    if recalled:
+        return MessageReplyOut(
+            id=ref.id,
+            sender_name=display_name(ref.sender) if ref.sender else (msg.reply_sender_name or ""),
+            content="",
+            recalled=True,
+        )
+    content = (ref.content or msg.reply_content_snapshot or "").strip()
+    name = (
+        display_name(ref.sender)
+        if ref.sender
+        else (msg.reply_sender_name or "")
+    )
+    return MessageReplyOut(id=ref.id, sender_name=name, content=content, recalled=False)
+
+
 def _msg_out(msg: ChatMessage, me: User) -> MessageOut:
+    recalled = msg.recalled_at is not None
     return MessageOut(
         id=msg.id,
         thread_id=msg.thread_id,
         sender_id=msg.sender_id,
         sender_name=display_name(msg.sender) if msg.sender else "",
         sender_avatar_url=msg.sender.avatar_url if msg.sender else None,
-        content="" if msg.deleted_at else msg.content,
+        content="" if recalled or msg.deleted_at else msg.content,
         status=msg.status,
         created_at=msg.created_at,
         read_at=msg.read_at,
         is_mine=msg.sender_id == me.id,
+        recalled=recalled,
+        recalled_at=msg.recalled_at,
+        reply_to=_reply_out(msg),
     )
 
 
@@ -67,9 +102,19 @@ def _thread_out(db: Session, thread: ChatThread, me: User) -> ThreadOut:
     unread = sum(
         1
         for m in messages
-        if m.sender_id != me.id and m.status == MessageStatus.sent and m.deleted_at is None
+        if m.sender_id != me.id
+        and m.status == MessageStatus.sent
+        and m.deleted_at is None
+        and m.recalled_at is None
     )
-    last = next((m.content for m in reversed(messages) if not m.deleted_at), None)
+    last = next(
+        (
+            m.content
+            for m in reversed(messages)
+            if not m.deleted_at and not m.recalled_at
+        ),
+        None,
+    )
     return ThreadOut(
         id=thread.id,
         peer_id=peer_id,
@@ -98,7 +143,12 @@ def list_threads(
         .order_by(ChatThread.updated_at.desc())
         .all()
     )
-    return [_thread_out(db, t, current_user) for t in threads]
+    out: list[ThreadOut] = []
+    for t in threads:
+        item = _thread_out(db, t, current_user)
+        if item.peer_active:
+            out.append(item)
+    return out
 
 
 @router.get("/threads/{thread_id}/messages", response_model=list[MessageOut])
@@ -120,6 +170,7 @@ def list_messages(
             ChatMessage.sender_id != current_user.id,
             ChatMessage.status == MessageStatus.sent,
             ChatMessage.deleted_at.is_(None),
+            ChatMessage.recalled_at.is_(None),
         )
         .all()
     ):
@@ -127,9 +178,13 @@ def list_messages(
         msg.read_at = now
     db.commit()
 
+    # 含已撤回：前端显示「xxx撤回了一条消息」；清空会话的 deleted_at 仍不返回
     messages = (
         db.query(ChatMessage)
-        .options(joinedload(ChatMessage.sender))
+        .options(
+            joinedload(ChatMessage.sender),
+            joinedload(ChatMessage.reply_to).joinedload(ChatMessage.sender),
+        )
         .filter(ChatMessage.thread_id == thread.id, ChatMessage.deleted_at.is_(None))
         .order_by(ChatMessage.created_at.asc())
         .all()
@@ -165,11 +220,37 @@ async def send_message(
     if is_bot_user(peer) and not is_bot_user(current_user):
         assert_can_send_to_bot(current_user)
 
+    reply_to_id = None
+    reply_sender_name = None
+    reply_content_snapshot = None
+    if payload.reply_to_id is not None:
+        ref = (
+            db.query(ChatMessage)
+            .options(joinedload(ChatMessage.sender))
+            .filter(ChatMessage.id == payload.reply_to_id)
+            .first()
+        )
+        if (
+            not ref
+            or ref.thread_id != thread.id
+            or ref.deleted_at is not None
+        ):
+            raise HTTPException(status_code=400, detail="引用的消息不存在")
+        reply_to_id = ref.id
+        reply_sender_name = display_name(ref.sender) if ref.sender else "用户"
+        if ref.recalled_at is None:
+            reply_content_snapshot = (ref.content or "").strip()[:500]
+        else:
+            reply_content_snapshot = ""
+
     msg = ChatMessage(
         thread_id=thread.id,
         sender_id=current_user.id,
         content=content,
         status=MessageStatus.sent,
+        reply_to_id=reply_to_id,
+        reply_sender_name=reply_sender_name,
+        reply_content_snapshot=reply_content_snapshot,
     )
     thread.updated_at = datetime.utcnow()
     db.add(msg)
@@ -194,7 +275,49 @@ async def send_message(
 
     msg = (
         db.query(ChatMessage)
-        .options(joinedload(ChatMessage.sender))
+        .options(
+            joinedload(ChatMessage.sender),
+            joinedload(ChatMessage.reply_to).joinedload(ChatMessage.sender),
+        )
+        .filter(ChatMessage.id == msg.id)
+        .one()
+    )
+    return _msg_out(msg, current_user)
+
+
+@router.post("/messages/{message_id}/recall", response_model=MessageOut)
+def recall_message(
+    message_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> MessageOut:
+    """撤回自己发送的消息：软标记 recalled_at，正文仍保留在库中。"""
+    msg = (
+        db.query(ChatMessage)
+        .options(joinedload(ChatMessage.sender), joinedload(ChatMessage.thread))
+        .filter(ChatMessage.id == message_id)
+        .first()
+    )
+    if not msg or msg.deleted_at is not None:
+        raise HTTPException(status_code=404, detail="消息不存在")
+    thread = msg.thread
+    if not thread or current_user.id not in (thread.user_a_id, thread.user_b_id):
+        raise HTTPException(status_code=403, detail="无权操作该消息")
+    if msg.sender_id != current_user.id:
+        raise HTTPException(status_code=403, detail="只能撤回自己发送的消息")
+    if msg.recalled_at is not None:
+        return _msg_out(msg, current_user)
+
+    now = datetime.utcnow()
+    msg.recalled_at = now
+    thread.updated_at = now
+    db.commit()
+    msg = (
+        db.query(ChatMessage)
+        .options(
+            joinedload(ChatMessage.sender),
+            joinedload(ChatMessage.reply_to).joinedload(ChatMessage.sender),
+        )
         .filter(ChatMessage.id == msg.id)
         .one()
     )
@@ -327,6 +450,7 @@ def mark_read(
             ChatMessage.sender_id != current_user.id,
             ChatMessage.status == MessageStatus.sent,
             ChatMessage.deleted_at.is_(None),
+            ChatMessage.recalled_at.is_(None),
         )
         .all()
     ):

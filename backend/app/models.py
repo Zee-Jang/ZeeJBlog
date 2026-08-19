@@ -72,6 +72,9 @@ class User(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    # 软删除前备份，便于站长恢复账号
+    previous_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    previous_nickname: Mapped[str | None] = mapped_column(String(30), nullable=True)
     name: Mapped[str] = mapped_column(String(100))  # 兼容旧字段，与 nickname 同步
     nickname: Mapped[str] = mapped_column(String(30), default="")
     password_hash: Mapped[str] = mapped_column(String(255))
@@ -136,6 +139,7 @@ class Post(Base):
     title: Mapped[str] = mapped_column(String(200))
     body: Mapped[str] = mapped_column(Text)
     on_home: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    is_hidden: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     author: Mapped["User"] = relationship(back_populates="posts")
@@ -215,9 +219,20 @@ class ChatMessage(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     read_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # 用户撤回：仍出现在会话里显示「撤回了一条消息」；清空会话用 deleted_at 彻底对 UI 隐藏
+    recalled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # 引用回复：保留快照，即使原消息撤回/清空仍可展示灰条
+    reply_to_id: Mapped[int | None] = mapped_column(
+        ForeignKey("chat_messages.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    reply_sender_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    reply_content_snapshot: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
     thread: Mapped["ChatThread"] = relationship(back_populates="messages")
     sender: Mapped["User"] = relationship()
+    reply_to: Mapped["ChatMessage | None"] = relationship(
+        remote_side="ChatMessage.id", foreign_keys=[reply_to_id]
+    )
 
 
 class UserBlock(Base):

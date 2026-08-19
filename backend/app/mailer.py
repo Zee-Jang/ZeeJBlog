@@ -9,9 +9,9 @@ logger = logging.getLogger("zeej.mail")
 
 
 def send_email(to_email: str, subject: str, body: str) -> None:
-    """开发模式只打印到终端；正式模式走 SMTP。二者互斥，避免开发模式又去连 SMTP。"""
+    """开发模式只打印到终端；正式模式走 SMTP。未配置 SMTP 时直接失败，避免静默假成功。"""
     settings = get_settings()
-    if settings.mail_dev_mode or not settings.smtp_ready:
+    if settings.mail_dev_mode:
         logger.warning(
             "[MAIL DEV] to=%s subject=%s\n%s",
             to_email,
@@ -22,6 +22,9 @@ def send_email(to_email: str, subject: str, body: str) -> None:
             f"\n===== MAIL DEV =====\nto: {to_email}\nsubject: {subject}\n{body}\n====================\n"
         )
         return
+
+    if not settings.smtp_ready:
+        raise RuntimeError("SMTP 未配置：请设置 SMTP_HOST / SMTP_USERNAME / SMTP_PASSWORD / SMTP_FROM")
 
     msg = EmailMessage()
     msg["Subject"] = subject

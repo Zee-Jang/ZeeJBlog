@@ -48,7 +48,11 @@ def received(
         .order_by(ChatRequest.created_at.desc())
         .all()
     )
-    return [_out(r) for r in rows]
+    return [
+        _out(r)
+        for r in rows
+        if r.sender and r.sender.is_active and r.receiver and r.receiver.is_active
+    ]
 
 
 @router.get("/sent", response_model=list[ChatRequestOut])
@@ -63,7 +67,11 @@ def sent(
         .order_by(ChatRequest.created_at.desc())
         .all()
     )
-    return [_out(r) for r in rows]
+    return [
+        _out(r)
+        for r in rows
+        if r.sender and r.sender.is_active and r.receiver and r.receiver.is_active
+    ]
 
 
 @router.post("", response_model=ChatRequestOut, status_code=status.HTTP_201_CREATED)

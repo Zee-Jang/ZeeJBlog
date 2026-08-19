@@ -171,6 +171,7 @@ class PostOut(BaseModel):
     created_at: UtcDateTime
     author_name: str = ""
     on_home: bool = False
+    is_hidden: bool = False
 
 
 class PostCreate(BaseModel):
@@ -184,6 +185,7 @@ class PostUpdate(BaseModel):
     title: str | None = Field(default=None, min_length=1, max_length=200)
     body: str | None = Field(default=None, min_length=1, max_length=50000)
     on_home: bool | None = None
+    is_hidden: bool | None = None
 
 
 class PostAppend(BaseModel):
@@ -233,6 +235,13 @@ class ProjectImportPreview(BaseModel):
     source: str
 
 
+class MessageReplyOut(BaseModel):
+    id: int
+    sender_name: str = ""
+    content: str = ""
+    recalled: bool = False
+
+
 class MessageOut(BaseModel):
     id: int
     thread_id: int
@@ -244,10 +253,14 @@ class MessageOut(BaseModel):
     created_at: UtcDateTime
     read_at: UtcDateTimeOpt
     is_mine: bool = False
+    recalled: bool = False
+    recalled_at: UtcDateTimeOpt = None
+    reply_to: MessageReplyOut | None = None
 
 
 class MessageCreate(BaseModel):
     content: str = Field(min_length=1, max_length=2000)
+    reply_to_id: int | None = None
 
 
 class ThreadOut(BaseModel):
