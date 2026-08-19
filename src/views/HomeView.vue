@@ -59,7 +59,7 @@ function previewText(s: string, max = 72) {
 }
 
 function openPost(id: number) {
-  router.push(`/muses/${id}`)
+  router.push({ name: 'muse-detail', params: { id: String(id) } })
 }
 </script>
 
@@ -205,6 +205,7 @@ h1 {
   padding: 0;
   display: grid;
   gap: 0.85rem;
+  min-width: 0;
 }
 .posts li.card {
   border: 1px solid var(--line);
@@ -212,6 +213,9 @@ h1 {
   padding: 1rem 1.1rem;
   background: rgba(255, 255, 255, 0.62);
   cursor: pointer;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
 }
 .posts li.card:hover {
   border-color: rgba(47, 111, 94, 0.35);
@@ -223,11 +227,13 @@ h1 {
   margin-bottom: 0.35rem;
   font-size: 0.8rem;
   color: rgba(20, 32, 27, 0.5);
+  min-width: 0;
 }
 .tag {
   border: 1px solid var(--line);
   border-radius: 999px;
   padding: 0.1rem 0.45rem;
+  flex-shrink: 0;
 }
 .posts h3 {
   margin: 0 0 0.35rem;
@@ -240,10 +246,19 @@ h1 {
   line-height: 1.65;
   color: rgba(20, 32, 27, 0.78);
 }
+/* 单行截断：勿用 nowrap 撑破网格（手机端会出现整页右移/右侧白边） */
 .clip {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 1;
+  line-clamp: 1;
   overflow: hidden;
   text-overflow: ellipsis;
-  white-space: nowrap;
+  white-space: normal;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  min-width: 0;
+  max-width: 100%;
 }
 .muted {
   color: rgba(20, 32, 27, 0.5);

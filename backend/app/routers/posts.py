@@ -7,6 +7,7 @@ from app.auth import get_current_user, require_admin
 from app.database import get_db
 from app.models import Post, PostKind, User
 from app.schemas import PostAppend, PostCreate, PostOut, PostUpdate
+from app.services import is_admin
 from app.timeutil import EAST_ASIA, UTC
 
 router = APIRouter(prefix="/api/posts", tags=["posts"])
@@ -23,6 +24,7 @@ def _to_out(post: Post) -> PostOut:
         created_at=post.created_at,
         author_name=(post.author.nickname or post.author.name) if post.author else "Zeej",
         on_home=bool(getattr(post, "on_home", False)),
+        is_hidden=bool(getattr(post, "is_hidden", False)),
     )
 
 
@@ -31,13 +33,19 @@ def list_posts(
     kind: PostKind | None = Query(default=None),
     on_home: bool | None = Query(default=None),
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
 ) -> list[PostOut]:
     query = db.query(Post).options(joinedload(Post.author))
+    # 普通用户看不到隐藏帖；站长可见（列表里会虚化）
+    if not is_admin(current_user):
+        query = query.filter(Post.is_hidden.is_(False))
     if kind is not None:
         query = query.filter(Post.kind == kind)
     if on_home is not None:
         query = query.filter(Post.on_home.is_(on_home))
+        # 主页推送对访客也必须排除隐藏
+        if on_home:
+            query = query.filter(Post.is_hidden.is_(False))
     posts = query.order_by(Post.created_at.desc()).all()
     return [_to_out(p) for p in posts]
 
@@ -54,6 +62,7 @@ def create_post(
         title=payload.title.strip(),
         body=payload.body.strip(),
         on_home=False,
+        is_hidden=False,
     )
     db.add(post)
     db.commit()
@@ -89,6 +98,8 @@ def update_post(
         post.body = payload.body.strip()
     if payload.on_home is not None:
         post.on_home = payload.on_home
+    if payload.is_hidden is not None:
+        post.is_hidden = payload.is_hidden
     db.commit()
     db.refresh(post)
     return _to_out(post)
@@ -109,6 +120,26 @@ def toggle_home(
     if not post:
         raise HTTPException(status_code=404, detail="内容不存在")
     post.on_home = not bool(post.on_home)
+    db.commit()
+    db.refresh(post)
+    return _to_out(post)
+
+
+@router.post("/{post_id}/hide", response_model=PostOut)
+def toggle_hide(
+    post_id: int,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+) -> PostOut:
+    post = (
+        db.query(Post)
+        .options(joinedload(Post.author))
+        .filter(Post.id == post_id)
+        .first()
+    )
+    if not post:
+        raise HTTPException(status_code=404, detail="内容不存在")
+    post.is_hidden = not bool(post.is_hidden)
     db.commit()
     db.refresh(post)
     return _to_out(post)

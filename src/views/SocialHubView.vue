@@ -232,7 +232,7 @@ const peers = computed(() => {
     if (!item.name && r.receiver_name) item.name = r.receiver_name
     map.set(r.receiver_id, item)
   }
-  let list = [...map.values()]
+  let list = [...map.values()].filter((p) => p.peerActive !== false)
   const key = q.value.trim().toLowerCase()
   if (key) list = list.filter((p) => p.name.toLowerCase().includes(key))
   list.sort((a, b) => {
@@ -246,6 +246,18 @@ const peers = computed(() => {
   })
   return list
 })
+
+watch(
+  peers,
+  (list) => {
+    if (selectedId.value && !list.some((p) => p.userId === selectedId.value)) {
+      selectedId.value = null
+      mobilePane.value = 'list'
+      messages.value = []
+    }
+  },
+  { flush: 'post' },
+)
 
 const badgeCount = computed(
   () =>
@@ -268,9 +280,11 @@ const mode = computed<Mode>(() => {
   return 'request'
 })
 
+const sending = ref(false)
 const canSend = computed(
   () =>
     mode.value === 'chat' &&
+    !sending.value &&
     !auth.user?.is_muted &&
     selected.value?.peerActive !== false &&
     !botThinking.value &&
@@ -279,14 +293,31 @@ const canSend = computed(
 const amMuted = computed(() => Boolean(auth.user?.is_muted))
 
 function statusLabel(msg: ChatMessage) {
+  if (msg.recalled) return ''
   if (msg.localStatus === 'sending') return tr('social.sending')
   if (msg.localStatus === 'failed') return tr('social.failed')
   if (!msg.is_mine) return ''
-  return msg.status === 'read' ? tr('social.read') : tr('social.sent')
+  if (msg.status === 'read') {
+    const when = msg.read_at ? formatTime(msg.read_at) : ''
+    return when ? `${tr('social.read')} ${when}` : tr('social.read')
+  }
+  return tr('social.sent')
+}
+
+function recallNotice(msg: ChatMessage) {
+  if (msg.is_mine) return tr('social.recalledYou')
+  const name = selected.value?.name || msg.sender_name || tr('social.sys')
+  return tr('social.recalledPeer', { name })
 }
 
 function formatTime(iso: string) {
   return formatDateShanghai(iso, 'chat', { yesterday: tr('time.yesterday') })
+}
+
+function clipText(s: string, n = 80) {
+  const t = (s || '').trim().replace(/\s+/g, ' ')
+  if (t.length <= n) return t
+  return `${t.slice(0, n)}…`
 }
 
 function showTimeDivider(curr: ChatMessage, prev?: ChatMessage) {
@@ -300,6 +331,17 @@ function showTimeDivider(curr: ChatMessage, prev?: ChatMessage) {
 async function scrollBottom() {
   await nextTick()
   if (listEl.value) listEl.value.scrollTop = listEl.value.scrollHeight
+}
+
+function dedupeMessages(list: ChatMessage[]): ChatMessage[] {
+  const seen = new Set<number>()
+  const out: ChatMessage[] = []
+  for (const m of list) {
+    if (seen.has(m.id)) continue
+    seen.add(m.id)
+    out.push(m)
+  }
+  return out
 }
 
 async function loadAll() {
@@ -321,12 +363,17 @@ async function loadMessages(threadId: number, scroll: 'bottom' | 'preserve' = 'b
   const el = listEl.value
   const distFromBottom = el ? el.scrollHeight - el.scrollTop - el.clientHeight : 0
   const nearBottom = distFromBottom < 80
-  // 保留发送中/失败的临时气泡，避免轮询冲掉
   const locals = messages.value.filter((m) => m.id < 0)
   const { data } = await api.get<ChatMessage[]>(`/api/chat/threads/${threadId}/messages`)
-  messages.value = [...data, ...locals]
+  // 服务端已有同内容自己的消息时，丢掉对应临时气泡，避免双份
+  const serverMine = new Set(
+    data.filter((m) => m.is_mine).map((m) => `${m.content.trim()}\0${m.sender_id}`),
+  )
+  const keptLocals = locals.filter(
+    (m) => !serverMine.has(`${m.content.trim()}\0${m.sender_id}`),
+  )
+  messages.value = dedupeMessages([...data, ...keptLocals])
   await nextTick()
-  // 查找高亮期间不要强行滚到底
   if (highlightId.value) return
   if (scroll === 'bottom' || nearBottom) await scrollBottom()
 }
@@ -345,6 +392,10 @@ function selectPeer(p: PeerItem) {
   chatMenuOpen.value = false
   searchOpen.value = false
   highlightId.value = null
+  quoteTarget.value = null
+  showSideTimes.value = false
+  blankMenu.value = null
+  closeMsgMenu()
   if (p.isBot && !p.threadId && !p.blocked) {
     void openBotChat()
     return
@@ -439,7 +490,9 @@ function runKeywordSearch() {
     searchHits.value = []
     return
   }
-  searchHits.value = messages.value.filter((m) => (m.content || '').toLowerCase().includes(q))
+  searchHits.value = messages.value.filter(
+    (m) => !m.recalled && (m.content || '').toLowerCase().includes(q),
+  )
 }
 
 function runDateSearch() {
@@ -448,7 +501,9 @@ function runDateSearch() {
     searchHits.value = []
     return
   }
-  searchHits.value = messages.value.filter((m) => formatDateShanghai(m.created_at, 'date') === day)
+  searchHits.value = messages.value.filter(
+    (m) => !m.recalled && formatDateShanghai(m.created_at, 'date') === day,
+  )
 }
 
 async function jumpToHit(msg: ChatMessage) {
@@ -574,8 +629,21 @@ async function unblockPeer() {
 
 async function send() {
   const p = selected.value
-  if (!p?.threadId || !canSend.value) return
+  // 同步锁：防止 Enter + 表单 submit、或连点导致同内容打两次 API
+  if (!p?.threadId || sending.value || !canSend.value) return
   const content = draft.value.trim()
+  if (!content) return
+  sending.value = true
+  const reply = quoteTarget.value
+  const replyPayload =
+    reply && reply.id > 0
+      ? {
+          id: reply.id,
+          sender_name: reply.sender_name,
+          content: reply.recalled ? '' : reply.content,
+          recalled: Boolean(reply.recalled),
+        }
+      : null
   const tempId = -Date.now()
   messages.value = [
     ...messages.value,
@@ -590,41 +658,313 @@ async function send() {
       created_at: new Date().toISOString(),
       read_at: null,
       is_mine: true,
+      recalled: false,
+      reply_to: replyPayload,
       localStatus: 'sending',
     },
   ]
   draft.value = ''
+  quoteTarget.value = null
   showEmoji.value = false
   await scrollBottom()
   const talkingBot = Boolean(p.isBot)
   if (talkingBot) botThinking.value = true
   try {
+    const body: { content: string; reply_to_id?: number } = { content }
+    if (reply && reply.id > 0) body.reply_to_id = reply.id
     const { data } = await api.post<ChatMessage>(
       `/api/chat/threads/${p.threadId}/messages`,
-      { content },
+      body,
       { timeout: 90000 },
     )
-    messages.value = messages.value.map((m) => (m.id === tempId ? data : m))
+    // 先去掉临时气泡，再写入正式消息并去重（避免轮询已插入同 id）
+    messages.value = dedupeMessages([
+      ...messages.value.filter((m) => m.id !== tempId && m.id !== data.id),
+      data,
+    ])
     await loadAll()
-    if (p.threadId) await loadMessages(p.threadId)
+    // 不立刻全量重拉消息，减少和轮询打架；下一次 refresh 会对齐
   } catch (e: unknown) {
     messages.value = messages.value.filter((m) => m.id !== tempId)
     draft.value = content
+    if (reply) quoteTarget.value = reply
     error.value = formatApiError(e, tr('social.errSend'))
   } finally {
+    sending.value = false
     botThinking.value = false
+    await scrollBottom()
+  }
+}
+
+const recallingId = ref<number | null>(null)
+const msgMenuId = ref<number | null>(null)
+const quoteTarget = ref<ChatMessage | null>(null)
+const showSideTimes = ref(false)
+const blankMenu = ref<{ x: number; y: number } | null>(null)
+
+function showAllSideTimes() {
+  showSideTimes.value = true
+  blankMenu.value = null
+  closeMsgMenu()
+}
+
+function hideAllSideTimes() {
+  showSideTimes.value = false
+  blankMenu.value = null
+  closeMsgMenu()
+}
+
+function onMessagesContextMenu(e: MouseEvent) {
+  const t = e.target as HTMLElement | null
+  if (!t) return
+  // 气泡上的右键留给引用/撤回，不在这里处理
+  if (t.closest('.bubble, .msg-menu, .blank-menu')) return
+  e.preventDefault()
+  e.stopPropagation()
+  closeMsgMenu()
+  blankMenu.value = { x: e.clientX, y: e.clientY }
+}
+
+function closeBlankMenu() {
+  blankMenu.value = null
+}
+
+function onMessagesClick() {
+  closeBlankMenu()
+  closeMsgMenu()
+}
+
+function sideTimeLabel(iso: string) {
+  return formatDateShanghai(iso, 'chat', { yesterday: tr('time.yesterday') })
+}
+
+function openMsgMenu(msg: ChatMessage, e?: Event) {
+  e?.preventDefault()
+  e?.stopPropagation()
+  if (msg.recalled || msg.id < 0 || msg.localStatus === 'sending') return
+  blankMenu.value = null
+  msgMenuId.value = msgMenuId.value === msg.id ? null : msg.id
+}
+
+function closeMsgMenu() {
+  msgMenuId.value = null
+}
+
+let longPressTimer = 0
+function onBubblePressStart(msg: ChatMessage, e: TouchEvent | MouseEvent) {
+  if ('button' in e && e.button !== 0) return
+  if (longPressTimer) window.clearTimeout(longPressTimer)
+  longPressTimer = window.setTimeout(() => {
+    longPressTimer = 0
+    openMsgMenu(msg, e)
+  }, 480)
+}
+function onBubblePressEnd() {
+  if (longPressTimer) {
+    window.clearTimeout(longPressTimer)
+    longPressTimer = 0
+  }
+}
+
+function setQuote(msg: ChatMessage) {
+  if (msg.recalled || msg.id < 0) return
+  quoteTarget.value = msg
+  closeMsgMenu()
+  void nextTick(() => {
+    const ta = composerEl.value?.querySelector('textarea') as HTMLTextAreaElement | null
+    ta?.focus()
+  })
+}
+
+function clearQuote() {
+  quoteTarget.value = null
+}
+
+async function jumpToQuoted(id: number) {
+  highlightId.value = id
+  await nextTick()
+  const el = listEl.value?.querySelector(`[data-msg-id="${id}"]`) as HTMLElement | null
+  el?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+  window.setTimeout(() => {
+    if (highlightId.value === id) highlightId.value = null
+  }, 1600)
+}
+
+async function recallMessage(msg: ChatMessage) {
+  if (!msg.is_mine || msg.recalled || msg.id < 0 || recallingId.value) return
+  closeMsgMenu()
+  recallingId.value = msg.id
+  error.value = ''
+  try {
+    const { data } = await api.post<ChatMessage>(`/api/chat/messages/${msg.id}/recall`)
+    messages.value = messages.value.map((m) => (m.id === msg.id ? { ...m, ...data } : m))
+    if (quoteTarget.value?.id === msg.id) quoteTarget.value = { ...quoteTarget.value, recalled: true, content: '' }
+    await loadAll()
+  } catch (e: unknown) {
+    error.value = formatApiError(e, tr('social.errRecall'))
+  } finally {
+    recallingId.value = null
   }
 }
 
 defineExpose({ badgeCount })
 
+const composerEl = ref<HTMLElement | null>(null)
+const composerPad = ref(0)
+let composerFocusPoll = 0
+
+function syncChatImmersive() {
+  const on =
+    mobilePane.value === 'detail' && window.matchMedia('(max-width: 800px)').matches
+  window.dispatchEvent(new CustomEvent('zeej:chat-immersive', { detail: on }))
+  placeComposerDock()
+}
+
+function clearHubDock() {
+  const hub = hubEl.value
+  if (!hub) return
+  hub.style.position = ''
+  hub.style.top = ''
+  hub.style.left = ''
+  hub.style.right = ''
+  hub.style.width = ''
+  hub.style.height = ''
+  hub.style.zIndex = ''
+  hub.style.borderRadius = ''
+  hub.style.maxHeight = ''
+}
+
+/**
+ * 聚焦时把整个对话面板钉在 visualViewport 内：
+ * 输入栏在面板底部（文档流），贴齐可视区底边，避免 bottom inset 算大留下白缝。
+ * 齿轮/Done 栏是系统输入法或浏览器控件，网页无法去除。
+ */
+function placeComposerDock() {
+  const hub = hubEl.value
+  const el = composerEl.value
+  const mobile = window.matchMedia('(max-width: 800px)').matches
+  const shouldDock = mobile && mobilePane.value === 'detail' && !!hub
+  if (!shouldDock) {
+    clearHubDock()
+    if (el) {
+      el.style.position = ''
+      el.style.left = ''
+      el.style.right = ''
+      el.style.bottom = ''
+      el.style.top = ''
+      el.style.width = ''
+      el.style.zIndex = ''
+    }
+    composerPad.value = 0
+    return
+  }
+
+  const vv = window.visualViewport
+  const focused = !!el && !!document.activeElement && el.contains(document.activeElement)
+
+  // 输入栏保持文档流，不单独 fixed
+  if (el) {
+    el.style.position = ''
+    el.style.left = ''
+    el.style.right = ''
+    el.style.bottom = ''
+    el.style.top = ''
+    el.style.width = ''
+    el.style.zIndex = ''
+  }
+  composerPad.value = 0
+
+  if (focused && vv) {
+    const top = Math.max(0, Math.round(vv.offsetTop))
+    const height = Math.max(200, Math.round(vv.height))
+    hub.style.position = 'fixed'
+    hub.style.left = '0'
+    hub.style.right = '0'
+    hub.style.width = '100%'
+    hub.style.top = `${top}px`
+    hub.style.height = `${height}px`
+    hub.style.maxHeight = `${height}px`
+    hub.style.zIndex = '60'
+    hub.style.borderRadius = '0'
+  } else {
+    clearHubDock()
+  }
+}
+
+function onComposerFocus() {
+  placeComposerDock()
+  window.setTimeout(() => {
+    placeComposerDock()
+    void scrollBottom()
+  }, 50)
+  window.setTimeout(() => {
+    placeComposerDock()
+    void scrollBottom()
+  }, 300)
+  if (composerFocusPoll) window.clearInterval(composerFocusPoll)
+  composerFocusPoll = window.setInterval(() => placeComposerDock(), 100)
+}
+
+function onComposerBlur() {
+  window.setTimeout(() => {
+    const a = document.activeElement
+    if (a && composerEl.value?.contains(a)) return
+    if (composerFocusPoll) {
+      window.clearInterval(composerFocusPoll)
+      composerFocusPoll = 0
+    }
+    clearHubDock()
+    window.scrollTo(0, 0)
+    placeComposerDock()
+  }, 0)
+  window.setTimeout(() => {
+    clearHubDock()
+    window.scrollTo(0, 0)
+    placeComposerDock()
+  }, 350)
+}
+
+function backToList() {
+  mobilePane.value = 'list'
+  if (composerFocusPoll) {
+    window.clearInterval(composerFocusPoll)
+    composerFocusPoll = 0
+  }
+  clearHubDock()
+  window.scrollTo(0, 0)
+  document.documentElement.scrollTop = 0
+  document.body.scrollTop = 0
+  window.dispatchEvent(new CustomEvent('zeej:viewport-reset'))
+  syncChatImmersive()
+  window.setTimeout(() => {
+    window.scrollTo(0, 0)
+    window.dispatchEvent(new CustomEvent('zeej:viewport-reset'))
+  }, 50)
+  window.setTimeout(() => {
+    window.scrollTo(0, 0)
+    window.dispatchEvent(new CustomEvent('zeej:viewport-reset'))
+  }, 320)
+}
+
+watch(mobilePane, () => syncChatImmersive())
+
 onMounted(async () => {
   await loadAll()
   timer = window.setInterval(() => void refresh(), 4000)
   await maybeOpenFromQuery()
+  syncChatImmersive()
+  window.addEventListener('resize', syncChatImmersive)
+  window.visualViewport?.addEventListener('resize', placeComposerDock)
+  window.visualViewport?.addEventListener('scroll', placeComposerDock)
 })
 onUnmounted(() => {
   if (timer) window.clearInterval(timer)
+  if (composerFocusPoll) window.clearInterval(composerFocusPoll)
+  if (longPressTimer) window.clearTimeout(longPressTimer)
+  window.removeEventListener('resize', syncChatImmersive)
+  window.visualViewport?.removeEventListener('resize', placeComposerDock)
+  window.visualViewport?.removeEventListener('scroll', placeComposerDock)
+  window.dispatchEvent(new CustomEvent('zeej:chat-immersive', { detail: false }))
 })
 
 async function maybeOpenFromQuery() {
@@ -708,7 +1048,7 @@ watch(
 
     <section class="panel">
       <header class="panel-head">
-        <button class="back" type="button" @click="mobilePane = 'list'">←</button>
+        <button class="back" type="button" @click="backToList">←</button>
         <strong>
           {{ selected?.name || tr('social.pick') }}
           <em v-if="selected?.isBot" class="bot-tag">{{ tr('social.botTag') }}</em>
@@ -823,19 +1163,54 @@ watch(
       </div>
 
       <template v-else>
-        <div ref="listEl" class="messages">
+        <div
+          ref="listEl"
+          class="messages"
+          @click="onMessagesClick"
+          @contextmenu="onMessagesContextMenu"
+        >
           <div class="sys-inline">
             {{ selected?.isBot ? tr('social.botCanChat') : tr('social.canChat') }}
           </div>
+          <p v-if="showSideTimes" class="times-hint">{{ tr('social.showTimesHint') }}</p>
+          <Teleport to="body">
+            <div
+              v-if="blankMenu"
+              class="blank-menu"
+              :style="{ left: `${blankMenu.x}px`, top: `${blankMenu.y}px` }"
+              @click.stop
+              @contextmenu.prevent
+            >
+              <button
+                v-if="!showSideTimes"
+                type="button"
+                @click="showAllSideTimes"
+              >
+                {{ tr('social.showTimesPrompt') }}
+              </button>
+              <button v-else type="button" @click="hideAllSideTimes">
+                {{ tr('social.hideTimesPrompt') }}
+              </button>
+            </div>
+          </Teleport>
           <template v-for="(msg, idx) in messages" :key="msg.id">
-            <div v-if="showTimeDivider(msg, messages[idx - 1])" class="time-divider">
+            <div
+              v-if="!showSideTimes && showTimeDivider(msg, messages[idx - 1])"
+              class="time-divider"
+            >
               {{ formatTime(msg.created_at) }}
             </div>
+            <div v-if="msg.recalled" class="recall-notice">{{ recallNotice(msg) }}</div>
             <div
+              v-else
               class="bubble-row"
-              :class="{ mine: msg.is_mine, hit: highlightId === msg.id }"
+              :class="{ mine: msg.is_mine, hit: highlightId === msg.id, timed: showSideTimes }"
               :data-msg-id="msg.id"
-            >              <div class="msg-stack">
+            >
+              <span v-if="showSideTimes && !msg.is_mine" class="side-time left">
+                {{ sideTimeLabel(msg.created_at) }}
+              </span>
+              <div class="msg-stack">
                 <div class="msg-line">
                   <div class="msg-avatar" aria-hidden="true">
                     <img
@@ -850,23 +1225,76 @@ watch(
                       ).slice(0, 1)
                     }}</span>
                   </div>
-                  <div class="bubble">
+                  <div
+                    class="bubble"
+                    :class="{ menuOn: msgMenuId === msg.id }"
+                    @contextmenu.prevent="openMsgMenu(msg, $event)"
+                    @touchstart.passive="onBubblePressStart(msg, $event)"
+                    @touchend="onBubblePressEnd"
+                    @touchmove="onBubblePressEnd"
+                    @touchcancel="onBubblePressEnd"
+                  >
+                    <button
+                      v-if="msg.reply_to"
+                      type="button"
+                      class="quote-card"
+                      @click.stop="jumpToQuoted(msg.reply_to.id)"
+                    >
+                      <strong>{{ msg.reply_to.sender_name }}</strong>
+                      <span>{{
+                        msg.reply_to.recalled
+                          ? tr('social.quoteRecalled')
+                          : clipText(msg.reply_to.content)
+                      }}</span>
+                    </button>
                     <p class="text">{{ msg.content }}</p>
+                    <div v-if="msgMenuId === msg.id" class="msg-menu" @click.stop>
+                      <button type="button" @click="setQuote(msg)">{{ tr('social.quote') }}</button>
+                      <button
+                        v-if="msg.is_mine"
+                        type="button"
+                        :disabled="recallingId === msg.id"
+                        @click="recallMessage(msg)"
+                      >
+                        {{
+                          recallingId === msg.id ? tr('social.recalling') : tr('social.recall')
+                        }}
+                      </button>
+                    </div>
                   </div>
                 </div>
                 <p v-if="msg.is_mine" class="status">{{ statusLabel(msg) }}</p>
               </div>
+              <span v-if="showSideTimes && msg.is_mine" class="side-time right">
+                {{ sideTimeLabel(msg.created_at) }}
+              </span>
             </div>
           </template>
           <p v-if="botThinking" class="bot-thinking">{{ tr('social.botThinking') }}</p>
         </div>
         <p v-if="amMuted" class="mute-banner">{{ tr('social.mutedBlock') }}</p>
-        <form class="composer" @submit.prevent="send">
+        <div v-if="quoteTarget && !amMuted" class="quote-bar">
+          <div class="quote-bar-body">
+            <strong>{{ quoteTarget.sender_name }}</strong>
+            <span>{{
+              quoteTarget.recalled
+                ? tr('social.quoteRecalled')
+                : clipText(quoteTarget.content, 120)
+            }}</span>
+          </div>
+          <button type="button" class="quote-bar-close" :aria-label="tr('social.quoteCancel')" @click="clearQuote">
+            ×
+          </button>
+        </div>
+        <form ref="composerEl" class="composer" @submit.prevent="send">
           <textarea
             v-model="draft"
             rows="1"
+            enterkeyhint="send"
             :placeholder="amMuted ? tr('social.mutedPh') : tr('social.say')"
-            :disabled="amMuted"
+            :disabled="amMuted || sending"
+            @focus="onComposerFocus"
+            @blur="onComposerBlur"
             @keydown.enter.exact.prevent="send"
           />
           <div class="composer-actions">
@@ -1332,7 +1760,8 @@ watch(
   background: #fff;
 }
 .sys-inline,
-.time-divider {
+.time-divider,
+.recall-notice {
   align-self: center;
   font-size: 0.68rem;
   color: rgba(20, 32, 27, 0.4);
@@ -1341,9 +1770,97 @@ watch(
   padding: 0.18rem 0.55rem;
   margin: 0.25rem 0;
 }
+.recall-notice {
+  max-width: 90%;
+  text-align: center;
+  line-height: 1.35;
+}
 .bubble-row {
   display: flex;
+  align-items: flex-end;
+  gap: 0.35rem;
+  width: 100%;
   max-width: 100%;
+  box-sizing: border-box;
+}
+.bubble-row.timed {
+  width: 100%;
+  box-sizing: border-box;
+  padding-inline: 0.15rem;
+}
+.bubble-row.timed.mine {
+  justify-content: flex-end;
+}
+.bubble-row.timed:not(.mine) {
+  justify-content: flex-start;
+}
+.side-time {
+  flex: 0 0 auto;
+  align-self: center;
+  min-width: 2.6rem;
+  font-size: 0.72rem;
+  line-height: 1.2;
+  color: rgba(20, 32, 27, 0.42);
+  font-variant-numeric: tabular-nums;
+  user-select: none;
+  pointer-events: none;
+  white-space: nowrap;
+  animation: side-time-in 0.2s ease;
+}
+.side-time.left {
+  text-align: left;
+  margin-right: 0.1rem;
+}
+.side-time.right {
+  text-align: right;
+  margin-left: 0.1rem;
+}
+@keyframes side-time-in {
+  from {
+    opacity: 0;
+    transform: translateY(2px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.times-hint {
+  align-self: center;
+  margin: 0.15rem 0 0.35rem;
+  padding: 0.2rem 0.6rem;
+  border-radius: 999px;
+  font-size: 0.68rem;
+  color: rgba(20, 32, 27, 0.45);
+  background: rgba(20, 32, 27, 0.05);
+}
+.blank-menu {
+  position: fixed;
+  z-index: 400;
+  min-width: 8.5rem;
+  padding: 0.25rem;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.98);
+  box-shadow: 0 8px 24px rgba(20, 32, 27, 0.12);
+  transform: translate(0, 0);
+}
+.blank-menu button {
+  display: block;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  padding: 0.5rem 0.75rem;
+  font: inherit;
+  font-size: 0.82rem;
+  color: var(--moss-deep);
+  cursor: pointer;
+  border-radius: 8px;
+  text-align: left;
+  white-space: nowrap;
+}
+.blank-menu button:hover {
+  background: rgba(47, 111, 94, 0.1);
 }
 .bubble-row.hit .bubble {
   outline: 2px solid rgba(47, 111, 94, 0.55);
@@ -1399,6 +1916,115 @@ watch(
   border: 1px solid var(--line);
   max-width: calc(100% - 2.85rem);
   min-width: 0;
+  cursor: default;
+}
+.msg-menu {
+  position: absolute;
+  z-index: 5;
+  top: calc(100% + 0.35rem);
+  right: 0;
+  display: grid;
+  min-width: 5.5rem;
+  padding: 0.25rem;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.98);
+  box-shadow: 0 8px 24px rgba(20, 32, 27, 0.12);
+}
+.bubble-row:not(.mine) .msg-menu {
+  right: auto;
+  left: 0;
+}
+.msg-menu button {
+  border: 0;
+  background: transparent;
+  padding: 0.45rem 0.7rem;
+  font: inherit;
+  font-size: 0.82rem;
+  color: var(--moss-deep);
+  cursor: pointer;
+  border-radius: 8px;
+  white-space: nowrap;
+  text-align: left;
+}
+.msg-menu button:hover:not(:disabled) {
+  background: rgba(47, 111, 94, 0.1);
+}
+.msg-menu button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.quote-card {
+  display: grid;
+  gap: 0.12rem;
+  width: 100%;
+  margin: 0 0 0.4rem;
+  padding: 0.35rem 0.5rem;
+  border: 0;
+  border-left: 2px solid rgba(47, 111, 94, 0.45);
+  border-radius: 6px;
+  background: rgba(20, 32, 27, 0.05);
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+}
+.quote-card strong {
+  font-size: 0.72rem;
+  font-weight: 650;
+  color: var(--moss-deep);
+}
+.quote-card span {
+  font-size: 0.78rem;
+  line-height: 1.35;
+  color: rgba(20, 32, 27, 0.55);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.bubble-row.mine .quote-card {
+  background: rgba(255, 255, 255, 0.35);
+  border-left-color: rgba(255, 255, 255, 0.7);
+}
+.bubble-row.mine .quote-card strong {
+  color: rgba(20, 32, 27, 0.72);
+}
+.quote-bar {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  margin: 0 0.85rem 0.35rem;
+  padding: 0.45rem 0.55rem 0.45rem 0.65rem;
+  border-radius: 10px;
+  border-left: 3px solid var(--moss);
+  background: rgba(47, 111, 94, 0.08);
+}
+.quote-bar-body {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  gap: 0.1rem;
+}
+.quote-bar-body strong {
+  font-size: 0.75rem;
+  color: var(--moss-deep);
+}
+.quote-bar-body span {
+  font-size: 0.8rem;
+  color: rgba(20, 32, 27, 0.58);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.quote-bar-close {
+  border: 0;
+  background: transparent;
+  color: rgba(20, 32, 27, 0.45);
+  font-size: 1.1rem;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0.1rem 0.25rem;
 }
 .bubble::after {
   content: '';
@@ -1456,6 +2082,7 @@ watch(
   padding: 0.75rem 0.85rem;
   border-top: 1px solid rgba(20, 32, 27, 0.14);
   background: #f0f3f1;
+  box-sizing: border-box;
 }
 .mute-banner {
   flex-shrink: 0;
@@ -1759,6 +2386,54 @@ watch(
   }
   .hub.detailOn .panel {
     display: flex;
+  }
+  .hub.detailOn {
+    border-radius: 0;
+    border: 0;
+    box-shadow: none;
+  }
+  /* 微信式顶栏：左返回，中对方名字，右菜单 */
+  .hub.detailOn .panel-head {
+    position: relative;
+    justify-content: center;
+    min-height: 2.85rem;
+    padding: 0.55rem 3rem;
+    background: #ededed;
+    border-bottom: 1px solid rgba(20, 32, 27, 0.08);
+  }
+  .hub.detailOn .panel-head .back {
+    position: absolute;
+    left: 0.35rem;
+    top: 50%;
+    transform: translateY(-50%);
+    display: inline-grid;
+    place-items: center;
+    width: 2.4rem;
+    height: 2.4rem;
+    font-size: 1.25rem;
+    border: 0;
+    background: transparent;
+  }
+  .hub.detailOn .panel-head strong {
+    margin: 0;
+    font-size: 1.05rem;
+    font-weight: 600;
+    text-align: center;
+  }
+  .hub.detailOn .head-actions {
+    position: absolute;
+    right: 0.35rem;
+    top: 50%;
+    transform: translateY(-50%);
+    margin-left: 0;
+  }
+  .hub.detailOn .composer {
+    padding: 0.55rem 0.65rem max(0.55rem, env(safe-area-inset-bottom, 0px));
+    background: #f7f7f7;
+  }
+  html.keyboard-open .hub.detailOn .composer,
+  html.input-focus .hub.detailOn .composer {
+    padding-bottom: 0.45rem;
   }
   .back {
     display: inline-block;

@@ -61,6 +61,7 @@ export interface Post {
   created_at: string
   author_name: string
   on_home?: boolean
+  is_hidden?: boolean
 }
 
 export interface Project {
@@ -80,6 +81,13 @@ export interface Project {
   created_at?: string | null
 }
 
+export interface ChatMessageReply {
+  id: number
+  sender_name: string
+  content: string
+  recalled: boolean
+}
+
 export interface ChatMessage {
   id: number
   thread_id: number
@@ -91,6 +99,9 @@ export interface ChatMessage {
   created_at: string
   read_at: string | null
   is_mine: boolean
+  recalled?: boolean
+  recalled_at?: string | null
+  reply_to?: ChatMessageReply | null
   localStatus?: 'sending' | 'failed'
 }
 

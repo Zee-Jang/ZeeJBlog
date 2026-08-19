@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from datetime import datetime
 
 from fastapi import FastAPI
@@ -18,12 +19,27 @@ ENCODERS_BY_TYPE[datetime] = lambda value: utc_iso(value)
 
 settings = get_settings()
 
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    """Apply schema updates and seed required rows before serving requests."""
+    migrate_schema()
+    ensure_dirs()
+    db = SessionLocal()
+    try:
+        seed_database(db)
+    finally:
+        db.close()
+    yield
+
+
 app = FastAPI(
     title="Zeej Blog API",
     version="1.1.0",
     docs_url="/api/docs",
     redoc_url=None,
     openapi_url="/api/openapi.json",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -47,18 +63,6 @@ app.include_router(invites.router)
 app.include_router(social.router)
 app.include_router(admin.router)
 app.include_router(site.router)
-
-
-@app.on_event("startup")
-def on_startup() -> None:
-    migrate_schema()
-    ensure_dirs()
-    db = SessionLocal()
-    try:
-        seed_database(db)
-    finally:
-        db.close()
-
 
 @app.get("/api/health")
 def health() -> dict[str, str]:
