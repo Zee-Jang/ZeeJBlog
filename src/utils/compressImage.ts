@@ -72,6 +72,7 @@ function canvasToBlob(canvas: HTMLCanvasElement, type: string, quality: number):
 export function avatarSrc(url: string | null | undefined, apiBase?: string): string | null {
   if (!url) return null
   if (/^https?:\/\//i.test(url) || url.startsWith('data:')) return url
-  const base = (apiBase ?? import.meta.env.VITE_API_BASE ?? 'http://127.0.0.1:8001').replace(/\/$/, '')
+  // Same-origin is the safe default. Local development can override this in .env.
+  const base = (apiBase ?? import.meta.env.VITE_API_BASE ?? '/').replace(/\/$/, '')
   return url.startsWith('/') ? `${base}${url}` : `${base}/${url}`
 }

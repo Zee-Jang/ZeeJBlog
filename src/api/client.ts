@@ -1,7 +1,8 @@
 import axios from 'axios'
 
 const api = axios.create({
-  baseURL: import.meta.env.VITE_API_BASE || 'http://127.0.0.1:8001',
+  // Same-origin is the safe default. Local development can override this in .env.
+  baseURL: import.meta.env.VITE_API_BASE || '/',
 })
 
 api.interceptors.request.use((config) => {
