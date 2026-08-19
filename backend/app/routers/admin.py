@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
@@ -17,6 +18,7 @@ from app.models import (
     User,
     UserRole,
 )
+from app.mailer import build_admin_notice_html, send_email
 from app.schemas import MessageOk, PublicUserOut, UtcDateTimeOpt, validate_password
 from app.services import (
     clear_mute_notifications,
@@ -35,6 +37,7 @@ from app.routers.site import (
 from app.timeutil import EAST_ASIA, UTC
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
+logger = logging.getLogger("zeej.admin")
 
 MUTE_REASONS = {
     "content_violation": "内容违规",
@@ -58,6 +61,13 @@ class AdminNotifyIn(BaseModel):
     content: str = Field(default="", max_length=500)
     # null / 省略 = 群发给所有活跃用户；指定 id = 单发
     user_id: int | None = None
+
+
+class AdminEmailNoticeIn(BaseModel):
+    user_id: int
+    subject: str = Field(min_length=1, max_length=160)
+    content: str = Field(min_length=1, max_length=5000)
+    also_in_app: bool = True
 
 
 class SiteSettingsOut(BaseModel):
@@ -610,6 +620,47 @@ def send_admin_notification(
         )
     db.commit()
     return MessageOk(detail=f"已群发通知给 {len(targets)} 人")
+
+
+@router.post("/email-notifications", response_model=MessageOk)
+def send_admin_email_notification(
+    payload: AdminEmailNoticeIn,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+) -> MessageOk:
+    user = db.get(User, payload.user_id)
+    if not user or not user.is_active:
+        raise HTTPException(status_code=404, detail="用户不存在或已停用")
+    if not user.email or user.email.startswith("deleted+") or "@invalid.local" in user.email:
+        raise HTTPException(status_code=400, detail="该用户没有可用邮箱")
+
+    subject = payload.subject.strip()
+    content = payload.content.strip()
+    if not subject or not content:
+        raise HTTPException(status_code=400, detail="请填写邮件标题和正文")
+    recipient_name = display_name(user)
+    plain_body = f"你好，{recipient_name}：\n\n{content}\n\n— Zeej\nhttps://zeej.me"
+    html_body = build_admin_notice_html(subject, content, recipient_name)
+    try:
+        send_email(user.email, f"【Zeej】{subject}", plain_body, html_body=html_body)
+    except Exception as exc:
+        logger.exception("Admin email delivery failed for user_id=%s", user.id)
+        raise HTTPException(
+            status_code=502,
+            detail="邮件发送失败，请检查 SMTP 配置后重试",
+        ) from exc
+
+    if payload.also_in_app:
+        push_notification(
+            db,
+            user_id=user.id,
+            type=NotificationType.admin_notice,
+            title=subject,
+            content=content[:500],
+            related_id=admin.id,
+        )
+        db.commit()
+    return MessageOk(detail=f"邮件已发送至 {user.email}")
 
 
 @router.get("/site", response_model=SiteSettingsOut)
