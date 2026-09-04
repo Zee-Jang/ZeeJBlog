@@ -1,10 +1,9 @@
-/** 本机记住登录表单（邮箱 + 密码）。仅存当前浏览器，非服务端加密。 */
+/** 本机记住登录邮箱。出于安全考虑不再存储密码；仅存当前浏览器。 */
 
 const STORAGE_KEY = 'zeej_remember_login'
 
 export interface RememberedLogin {
   email: string
-  password: string
 }
 
 function encode(text: string): string {
@@ -29,20 +28,22 @@ export function loadRememberedLogin(): RememberedLogin | null {
     if (!raw) return null
     const data = JSON.parse(raw) as { e?: string; p?: string }
     const email = decode(data.e || '')
-    const password = decode(data.p || '')
     if (!email) return null
-    return { email, password }
+    if (data.p !== undefined) {
+      // 旧版本曾存储过密码：改写为仅邮箱，清掉历史残留
+      saveRememberedLogin(email)
+    }
+    return { email }
   } catch {
     return null
   }
 }
 
-export function saveRememberedLogin(email: string, password: string): void {
+export function saveRememberedLogin(email: string): void {
   localStorage.setItem(
     STORAGE_KEY,
     JSON.stringify({
       e: encode(email.trim()),
-      p: encode(password),
     }),
   )
 }

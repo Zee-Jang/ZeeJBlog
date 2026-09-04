@@ -35,7 +35,7 @@ onMounted(() => {
   const queryEmail = typeof route.query.email === 'string' ? route.query.email.trim() : ''
   const saved = loadRememberedLogin()
   if (route.query.reset === '1') {
-    // 刚重置密码：清掉旧密码，只保留邮箱
+    // 刚重置密码：不再沿用记住的登录信息
     clearRememberedLogin()
     if (queryEmail) email.value = queryEmail
     remember.value = false
@@ -43,8 +43,7 @@ onMounted(() => {
   } else if (saved) {
     remember.value = true
     email.value = queryEmail || saved.email
-    // 仅当邮箱与记住的一致时才回填密码，避免串号
-    password.value = !queryEmail || queryEmail === saved.email ? saved.password : ''
+    password.value = ''
   } else if (queryEmail) {
     email.value = queryEmail
   }
@@ -56,7 +55,7 @@ async function onSubmit() {
   try {
     const mail = email.value.trim()
     await auth.login(mail, password.value)
-    if (remember.value) saveRememberedLogin(mail, password.value)
+    if (remember.value) saveRememberedLogin(mail)
     else clearRememberedLogin()
     const redirect = typeof route.query.redirect === 'string' ? route.query.redirect : '/'
     router.push(redirect)
