@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     # 仅当 seed_default_invite=true 时，启动才写入 default_invite_code
     default_invite_code: str = "ZEEJ-WELCOME"
     seed_default_invite: bool = False
+    # 旧聊天表（visitor_id 结构）重建开关：重建会清空全部聊天记录，
+    # 默认关闭；开启前必须先备份数据库
+    drop_legacy_chat_tables: bool = False
 
     smtp_host: str = ""
     smtp_port: int = 465

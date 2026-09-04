@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import inspect, text
 
 import app.routers.admin as admin_router
 from app.auth import hash_password
-from app.database import SessionLocal
+from app.config import get_settings
+from app.database import SessionLocal, engine
 from app.migrate import migrate_schema
 from app.models import ChatThread, ThreadStatus, User, UserRole
 
@@ -239,3 +242,42 @@ def test_admin_can_send_escaped_email_notice(
     assert "<script>" not in sent["html_body"]
     assert "&lt;script&gt;" in sent["html_body"]
     assert "Second paragraph" in sent["html_body"]
+
+
+def test_migrate_refuses_legacy_chat_tables_without_optin(client: TestClient) -> None:
+    """旧 visitor_id 聊天表默认禁止重建；显式开启开关后才允许。"""
+    settings = get_settings()
+    assert settings.drop_legacy_chat_tables is False
+
+    with engine.begin() as conn:
+        conn.execute(text("DROP TABLE IF EXISTS chat_messages"))
+        conn.execute(text("DROP TABLE IF EXISTS chat_threads"))
+        conn.execute(
+            text(
+                "CREATE TABLE chat_threads ("
+                "id INTEGER PRIMARY KEY, visitor_id INTEGER, status VARCHAR(20))"
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE TABLE chat_messages ("
+                "id INTEGER PRIMARY KEY, thread_id INTEGER, content VARCHAR(500))"
+            )
+        )
+
+    with pytest.raises(RuntimeError, match="DROP_LEGACY_CHAT_TABLES"):
+        migrate_schema()
+
+    # 未授权时聊天表必须原样保留，不能被静默清空
+    assert "chat_threads" in inspect(engine).get_table_names()
+    assert "visitor_id" in {c["name"] for c in inspect(engine).get_columns("chat_threads")}
+
+    settings.drop_legacy_chat_tables = True
+    try:
+        migrate_schema()
+    finally:
+        settings.drop_legacy_chat_tables = False
+
+    cols = {c["name"] for c in inspect(engine).get_columns("chat_threads")}
+    assert "visitor_id" not in cols
+    assert "user_a_id" in cols

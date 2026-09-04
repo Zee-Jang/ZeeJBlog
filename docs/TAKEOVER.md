@@ -36,6 +36,7 @@
 - SMTP：`SMTP_HOST`、`SMTP_PORT`、`SMTP_USERNAME`、`SMTP_PASSWORD`、`SMTP_FROM`
 - DeepSeek：`DEEPSEEK_API_KEY`、`DEEPSEEK_BASE_URL`、`DEEPSEEK_MODEL`
 - 远程项目导入：`GITHUB_TOKEN`、`GITEE_TOKEN`
+- 旧聊天表重建：`DROP_LEGACY_CHAT_TABLES=true`。检测到旧版 `visitor_id` 结构时启动会直接报错；只有备份数据库后显式开启，才会重建聊天表（清空聊天记录）
 
 生产环境必须保持：
 

@@ -1,6 +1,9 @@
 from sqlalchemy import inspect, text
 
+from app.config import get_settings
 from app.database import Base, engine
+
+settings = get_settings()
 
 
 def _has_column(table: str, column: str) -> bool:
@@ -62,8 +65,15 @@ def migrate_schema() -> None:
                 if not _has_column("invite_codes", name):
                     conn.execute(text(sql))
 
-    # 旧聊天结构（visitor_id）无法兼容 peer 私聊，开发期直接重建
+    # 旧聊天结构（visitor_id）无法兼容 peer 私聊；重建会清空全部聊天记录，
+    # 必须显式配置 DROP_LEGACY_CHAT_TABLES=true 才允许执行
     if "chat_threads" in tables and _has_column("chat_threads", "visitor_id"):
+        if not settings.drop_legacy_chat_tables:
+            raise RuntimeError(
+                "检测到旧版聊天表结构（chat_threads.visitor_id），需要重建聊天表。"
+                "重建将清空全部聊天记录：请先备份数据库，"
+                "再在 backend/.env 中设置 DROP_LEGACY_CHAT_TABLES=true 并重启。"
+            )
         with engine.begin() as conn:
             conn.execute(text("DROP TABLE IF EXISTS chat_messages"))
             conn.execute(text("DROP TABLE IF EXISTS chat_threads"))
